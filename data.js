@@ -230,6 +230,11 @@
     };
   }
 
-  const useRemote = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY && window.supabase);
-  window.Store = useRemote ? Remote : Local;
+  const configured = !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY);
+  if (configured && !window.supabase) {
+    // Keys are set but the Supabase library didn't load: show an error instead of silently using demo mode.
+    window.Store = { init: async () => { throw new Error('The Supabase library did not load. Check your internet connection and refresh the page.'); } };
+  } else {
+    window.Store = configured ? Remote : Local;
+  }
 })();
