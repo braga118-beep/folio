@@ -175,6 +175,7 @@ label .sub { font-weight: 400; }
 .modal h2 { font-size: 20px; margin: 0; }
 .modal .sub { margin: -4px 0 0; }
 .modal.wide { width: min(920px, 100%); background: var(--desk); padding: 20px 24px 28px; }
+.send-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
 .m-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
 .note { background: var(--amber-tint); color: var(--amber); border-radius: 10px; padding: 10px 14px; font-size: 13.5px; margin: 0; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }

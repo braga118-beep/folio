@@ -599,42 +599,106 @@
     }, 'wide');
   }
 
+  // Folio's own email sending (Resend) is off unless config.js sets USE_EMAIL_FUNCTION: true.
+  const useEmailFunction = () => S.mode === 'cloud' && !!(window.APP_CONFIG || {}).USE_EMAIL_FUNCTION;
+
+  async function markSent(d, kind, to) {
+    const now = new Date().toISOString();
+    const patch = { id: d.id, last_sent_at: now, sent_at: d.sent_at || now };
+    if (d.status === 'draft') patch.status = 'sent';
+    if (!d.customer_email && to) patch.customer_email = to;
+    const saved = await Store.upsert('documents', patch);
+    upsertLocal(S.documents, saved);
+    if (E && E.doc.id === d.id && patch.customer_email) E.doc.customer_email = to;
+    const ev = await Store.upsert('events', { document_id: d.id, kind: kind === 'reminder' ? 'reminder' : 'sent', detail: to || null, seen: true });
+    S.events.push(ev); S.known.add(ev.id);
+  }
+
   function sendModal(d, kind) {
     const co = company(d.company_id) || {};
     const t = totals(d);
     const tn = typeName(d);
     const hi = `Hi ${firstName(d.customer_name)},`;
+    const link = customerLink(d);
+    const own = !useEmailFunction();
     const subject = kind === 'reminder' ? `Reminder: invoice ${d.number} from ${co.name}` : `${tn} ${d.number} from ${co.name}`;
+    const linkLine = own ? 'using this link:\n' + link : 'using the link below.';
     let msg;
     if (kind === 'reminder') {
-      msg = `${hi}\n\nThis is a friendly reminder that invoice ${d.number} for ${money(t.balance)} ${d.due_date && d.due_date < today() ? 'was' : 'is'} due on ${fmtDate(d.due_date)}.\n\nYou can view the invoice online using the link below.\n\nThank you,\n${co.name}`;
+      msg = `${hi}\n\nThis is a friendly reminder that invoice ${d.number} for ${money(t.balance)} ${d.due_date && d.due_date < today() ? 'was' : 'is'} due on ${fmtDate(d.due_date)}.\n\nYou can view the invoice online ${linkLine}\n\nThank you,\n${co.name}`;
     } else if (d.type === 'estimate') {
-      msg = `${hi}\n\nThank you for the opportunity. Your estimate${d.job_title ? ' for ' + d.job_title.toLowerCase() : ''} is ready, with a total of ${money(t.total)}.\n\nYou can review and accept it online using the link below.\n\nBest regards,\n${co.name}`;
+      msg = `${hi}\n\nThank you for the opportunity. Your estimate${d.job_title ? ' for ' + d.job_title.toLowerCase() : ''} is ready, with a total of ${money(t.total)}.\n\nYou can review and accept it online ${linkLine}\n\nBest regards,\n${co.name}`;
     } else {
-      msg = `${hi}\n\nPlease find invoice ${d.number} for ${money(t.balance)}${d.due_date ? ', due ' + fmtDate(d.due_date) : ''}.\n\nYou can view the invoice online using the link below.\n\nThank you for your business,\n${co.name}`;
+      msg = `${hi}\n\nPlease find invoice ${d.number} for ${money(t.balance)}${d.due_date ? ', due ' + fmtDate(d.due_date) : ''}.\n\nYou can view and download the invoice online ${linkLine}\n\nThank you for your business,\n${co.name}`;
     }
     const verb = kind === 'reminder' ? 'Send reminder' : `Send ${tn.toLowerCase()}`;
+    const title = kind === 'reminder' ? 'Send payment reminder' : `Send ${tn.toLowerCase()} ${esc(d.number)}`;
+
+    const actions = own ? `
+      <div class="send-opts">
+        <button class="btn primary" data-via="gmail">Open in Gmail</button>
+        <button class="btn" data-via="mail">Open my email app</button>
+        <button class="btn" data-via="sms">Text message</button>
+        <button class="btn" data-via="copy">Copy message</button>
+      </div>
+      <p class="sub">Folio fills in the email for you. Review it and press send in your email. Folio marks the ${tn.toLowerCase()} as sent and notifies you when your customer opens the link.</p>`
+      : `<label class="check"><input type="checkbox" id="sAtt" checked> Attach a PDF copy</label>
+      <div class="m-actions"><button class="btn" data-close>Cancel</button><button class="btn primary" id="sGo">${verb}</button></div>`;
+
     modal(`
-      <h2>${kind === 'reminder' ? 'Send payment reminder' : `Send ${tn.toLowerCase()} ${esc(d.number)}`}</h2>
+      <h2>${title}</h2>
       <label>To<input id="sTo" type="email" value="${esc(d.customer_email)}" placeholder="customer@example.com"></label>
       <label>Subject<input id="sSub" value="${esc(subject)}"></label>
-      <label>Message<textarea id="sMsg" rows="10">${esc(msg)}</textarea></label>
-      <p class="sub">The email includes a button that opens the ${tn.toLowerCase()} online. You're notified when your customer opens it.</p>
-      <label class="check"><input type="checkbox" id="sAtt" checked> Attach a PDF copy</label>
-      ${S.mode === 'demo' ? '<p class="note">Demo mode doesn\'t send email. The document is marked as sent, and you can open the customer page to test view notifications.</p>' : ''}
-      <div class="m-actions"><button class="btn" data-close>Cancel</button><button class="btn primary" id="sGo">${verb}</button></div>`, (w, close) => {
+      <label>Message<textarea id="sMsg" rows="11">${esc(msg)}</textarea></label>
+      ${S.mode === 'demo' ? '<p class="note">Demo mode: the document is marked as sent, and you can open the customer page to test view notifications.</p>' : ''}
+      ${actions}`, (w, close) => {
+      const val = (id) => $(id, w).value.trim();
+      const finish = async (to, label) => {
+        try {
+          await markSent(d, kind, to);
+          close();
+          renderChrome();
+          toast(label, S.mode === 'demo' ? { action: 'Open customer page', onAction: () => window.open(link, '_blank'), ms: 9000 } : {});
+          afterDocChange(d.id);
+        } catch (e) { toast('Could not update the status: ' + e.message, { type: 'error' }); }
+      };
+
+      if (own) {
+        $$('[data-via]', w).forEach((b) => (b.onclick = async () => {
+          const via = b.dataset.via;
+          const to = val('#sTo'), sub = val('#sSub'), body = $('#sMsg', w).value;
+          if (via !== 'copy' && via !== 'sms' && !/^\S+@\S+\.\S+$/.test(to)) { toast('Enter a valid email address.', { type: 'error' }); return; }
+          const enc = encodeURIComponent;
+          if (via === 'gmail') {
+            window.open(`https://mail.google.com/mail/?view=cm&fs=1&to=${enc(to)}&su=${enc(sub)}&body=${enc(body)}`, '_blank');
+          } else if (via === 'mail') {
+            window.location.href = `mailto:${enc(to)}?subject=${enc(sub)}&body=${enc(body)}`;
+          } else if (via === 'sms') {
+            const phone = (d.customer_phone || '').replace(/[^\d+]/g, '');
+            const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+            window.location.href = `sms:${phone}${ios ? '&' : '?'}body=${enc(body)}`;
+          } else {
+            const text = `${sub}\n\n${body}`;
+            try { await navigator.clipboard.writeText(text); } catch (e) { prompt('Copy this message:', text); }
+          }
+          const done = { gmail: 'Gmail opened', mail: 'Email app opened', sms: 'Text message opened', copy: 'Message copied' }[via];
+          await finish(to, `${done}. ${tn} ${d.number} marked as sent.`);
+        }));
+        return;
+      }
+
       $('#sGo', w).onclick = async () => {
-        const to = $('#sTo', w).value.trim();
+        const to = val('#sTo');
         if (!/^\S+@\S+\.\S+$/.test(to)) { toast('Enter a valid email address.', { type: 'error' }); return; }
         const b = $('#sGo', w);
         b.disabled = true; b.textContent = 'Sending';
         try {
           let pdf_base64 = null;
-          if ($('#sAtt', w).checked && S.mode !== 'demo') {
+          if ($('#sAtt', w).checked) {
             const pdf = await D.toPdf(D.renderPaper(d, co));
             pdf_base64 = pdf.output('datauristring').split(',')[1];
           }
-          await Store.send({ document_id: d.id, to, subject: $('#sSub', w).value, message: $('#sMsg', w).value, kind, pdf_base64, filename: fileName(d) + '.pdf' });
+          await Store.send({ document_id: d.id, to, subject: val('#sSub'), message: $('#sMsg', w).value, kind, pdf_base64, filename: fileName(d) + '.pdf' });
           if (!d.customer_email) {
             const saved = await Store.upsert('documents', { id: d.id, customer_email: to });
             upsertLocal(S.documents, saved);
@@ -644,8 +708,7 @@
           S.events.forEach((e) => S.known.add(e.id));
           close();
           renderChrome();
-          const label = kind === 'reminder' ? 'Reminder' : tn;
-          toast(`${label} sent to ${to}`, S.mode === 'demo' ? { action: 'Open customer page', onAction: () => window.open(customerLink(d), '_blank'), ms: 9000 } : {});
+          toast(`${kind === 'reminder' ? 'Reminder' : tn} sent to ${to}`);
           afterDocChange(d.id);
         } catch (e) {
           toast('Could not send: ' + e.message, { type: 'error', ms: 8000 });
