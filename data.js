@@ -94,7 +94,10 @@
   const Remote = {
     sb: null,
     async init() {
-      this.sb = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+      // Accept a pasted URL with extra parts (like /rest/v1/ or a trailing slash): keep only https://xxxx.supabase.co
+      let url = String(cfg.SUPABASE_URL).trim();
+      try { url = new URL(url).origin; } catch (e) { throw new Error('The SUPABASE_URL in config.js is not a valid web address.'); }
+      this.sb = window.supabase.createClient(url, String(cfg.SUPABASE_ANON_KEY).trim());
       const { data } = await this.sb.auth.getSession();
       return { mode: 'cloud', user: data.session ? data.session.user : null };
     },
