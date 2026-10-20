@@ -764,7 +764,7 @@
       type, status: 'draft', company_id: co.id, customer_id: null, number: predictNumber(co, type),
       issue_date: today(), due_date: addDays(today(), type === 'invoice' ? (co.payment_terms_days ?? 30) : (co.estimate_valid_days ?? 30)),
       customer_name: '', customer_email: '', customer_phone: '', customer_address: '', job_title: '', job_site: '',
-      items: [{ kind: 'Labor', description: '', qty: 1, price: 0, taxable: false }],
+      items: [{ kind: 'Labor', description: '', qty: 1, price: 0, }],
       tax_rate: Number(co.tax_rate) || 0, discount_type: 'percent', discount_value: 0,
       notes: co.default_notes || '', terms: co.default_terms || '', amount_paid: 0
     };
@@ -791,8 +791,29 @@
     }
   }
 
-  function autosize(el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; }
-  function autosizeAll() { $$('#view textarea.ghost').forEach(autosize); }
+  function autosize(el) {
+    if (el.classList.contains('desc')) return fitDesc(el);
+    el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px';
+  }
+  // Description boxes: grow to fit the text, never hide text, and keep any height the user drags them to.
+  function fitDesc(el) {
+    const keep = el.offsetHeight;
+    el.style.minHeight = '0px';
+    el.style.height = 'auto';
+    const need = el.scrollHeight + 2;
+    el.style.minHeight = need + 'px';
+    el.style.height = Math.max(need, keep) + 'px';
+  }
+  function autosizeAll() { $$('#view textarea.ghost, #view textarea.desc').forEach(autosize); }
+  // Remember a dragged height so it survives adding or removing lines.
+  document.addEventListener('pointerup', () => {
+    if (!E) return;
+    $$('#itemRows textarea.desc').forEach((el) => {
+      const tr = el.closest('tr[data-i]');
+      const it = tr && E.doc.items[+tr.dataset.i];
+      if (it && Math.abs((it.h || 0) - el.offsetHeight) > 2 && el.style.height !== el.style.minHeight) it.h = el.offsetHeight;
+    });
+  });
 
   function drawEditor() {
     const v = $('#view');
@@ -852,7 +873,7 @@
             </div>
           </section>
           <table class="p-items edit-items">
-            <thead><tr><th>Description</th><th class="p-num">Qty</th><th class="p-num">Rate</th><th class="p-num" title="Taxable">Tax</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
+            <thead><tr><th>Description</th><th class="p-num">Rate</th><th class="p-num">Qty</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
             <tbody id="itemRows">${itemRows()}</tbody>
           </table>
           <button type="button" class="btn subtle add-line" data-act="addline">Add line item</button>
@@ -883,16 +904,15 @@
 
   function itemRows() {
     const items = E.doc.items;
-    if (!items.length) return '<tr class="none"><td colspan="6">No line items yet.</td></tr>';
+    if (!items.length) return '<tr class="none"><td colspan="5">No line items yet.</td></tr>';
     return items.map((it, i) => `
       <tr data-i="${i}">
         <td>
           <select class="ghost kind" data-k="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
-          <textarea class="ghost" data-k="description" rows="1" placeholder="Describe the work or material" aria-label="Description">${esc(it.description)}</textarea>
+          <textarea class="desc" data-k="description" rows="2" placeholder="Describe the work or material" aria-label="Description"${it.h ? ` style="height:${Number(it.h)}px"` : ''}>${esc(it.description)}</textarea>
         </td>
-        <td class="p-num"><input class="ghost r qty" type="number" step="any" min="0" data-k="qty" value="${it.qty ?? ''}" aria-label="Quantity"></td>
         <td class="p-num"><input class="ghost r rate" type="number" step="0.01" min="0" data-k="price" value="${it.price ?? ''}" aria-label="Rate"></td>
-        <td class="p-num"><input type="checkbox" data-k="taxable" ${it.taxable !== false ? 'checked' : ''} aria-label="Taxable"></td>
+        <td class="p-num"><input class="ghost r qty" type="number" step="any" min="0" data-k="qty" value="${it.qty ?? ''}" aria-label="Quantity"></td>
         <td class="p-num amt" data-amt="${i}"></td>
         <td class="p-num"><button type="button" class="x" data-act="rmline" data-i="${i}" aria-label="Remove line">×</button></td>
       </tr>`).join('');
@@ -1009,7 +1029,7 @@
   const ACTS = {
     save: () => saveDoc(),
     addline: () => {
-      E.doc.items.push({ kind: 'Labor', description: '', qty: 1, price: 0, taxable: false });
+      E.doc.items.push({ kind: 'Labor', description: '', qty: 1, price: 0, });
       markDirty();
       $('#itemRows').innerHTML = itemRows();
       autosizeAll(); updateTotals();

@@ -21,18 +21,17 @@
   };
 
   function totals(doc) {
-    let subtotal = 0, taxableSub = 0;
+    let subtotal = 0;
     (doc.items || []).forEach((it) => {
       const a = round2((Number(it.qty) || 0) * (Number(it.price) || 0));
       subtotal += a;
-      if (it.taxable !== false) taxableSub += a;
     });
     subtotal = round2(subtotal);
     const dv = Number(doc.discount_value) || 0;
     let discount = doc.discount_type === 'amount' ? dv : (subtotal * dv) / 100;
     discount = round2(Math.min(Math.max(discount, 0), subtotal));
     const ratio = subtotal ? (subtotal - discount) / subtotal : 0;
-    const tax = round2((taxableSub * ratio * (Number(doc.tax_rate) || 0)) / 100);
+    const tax = round2((subtotal * ratio * (Number(doc.tax_rate) || 0)) / 100);
     const total = round2(subtotal - discount + tax);
     const paid = round2(doc.amount_paid);
     return { subtotal, discount, tax, total, paid, balance: round2(total - paid) };
@@ -78,8 +77,8 @@
     const rows = (doc.items || []).map((it) => `
       <tr>
         <td class="p-desc">${it.kind ? `<div class="p-kind">${esc(it.kind)}</div>` : ''}${nl(it.description)}</td>
-        <td class="p-num">${num(it.qty)}</td>
         <td class="p-num">${money(it.price)}</td>
+        <td class="p-num">${num(it.qty)}</td>
         <td class="p-num">${money((Number(it.qty) || 0) * (Number(it.price) || 0))}</td>
       </tr>`).join('');
 
@@ -129,7 +128,7 @@
         ${project}
       </section>
       <table class="p-items">
-        <thead><tr><th>Description</th><th class="p-num">Qty</th><th class="p-num">Rate</th><th class="p-num">Amount</th></tr></thead>
+        <thead><tr><th>Description</th><th class="p-num">Rate</th><th class="p-num">Qty</th><th class="p-num">Amount</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="4" class="p-empty">No line items</td></tr>'}</tbody>
       </table>
       <section class="p-bottom">
