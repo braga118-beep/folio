@@ -992,7 +992,7 @@
     const sr = el.closest('tr[data-si]');
     if (el.dataset.sk && sr) {
       const m = E.doc.schedule[+sr.dataset.si];
-      m[el.dataset.sk] = el.dataset.sk === 'percent' ? parseFloat(el.value) || 0 : el.value;
+      editMilestone(m, el.dataset.sk, el.value, sr);
       markDirty(); updateTotals();
       return;
     }
@@ -1087,7 +1087,7 @@
     },
     addsched: () => {
       E.doc.schedule = E.doc.schedule || [];
-      const used = E.doc.schedule.reduce((s, m) => s + (m.basis === 'all' ? Number(m.percent) || 0 : 0), 0);
+      const used = E.doc.schedule.reduce((s, m) => s + (m.basis === 'all' && !isFixedM(m) ? Number(m.percent) || 0 : 0), 0);
       E.doc.schedule.push({ name: '', percent: Math.max(0, 100 - used), basis: 'all' });
       markDirty(); redrawSched();
     },
@@ -1199,12 +1199,28 @@
       { name: 'Deposit, due on start day', percent: 50, basis: 'all' },
       { name: 'After rough-in', percent: 25, basis: 'all' },
       { name: 'At completion', percent: 25, basis: 'all' }] },
+    d: { label: '$500 booking deposit, then 50 / 50', list: [
+      { name: 'Booking deposit', mode: 'amount', amount: 500, basis: 'all' },
+      { name: 'On start day', percent: 50, basis: 'all' },
+      { name: 'At completion', percent: 50, basis: 'all' }] },
     c: { label: 'Materials upfront, labor 50 / 25 / 25', list: [
       { name: 'Materials, due before ordering', percent: 100, basis: 'materials' },
       { name: 'Labor deposit, on start day', percent: 50, basis: 'labor' },
       { name: 'After rough-in', percent: 25, basis: 'labor' },
       { name: 'At completion', percent: 25, basis: 'labor' }] }
   };
+  const isFixedM = (m) => m.mode === 'amount';
+  const valueOf = (m) => (isFixedM(m) ? Number(m.amount) || 0 : Number(m.percent) || 0);
+  const modeOptions = (m) => `<option value="percent" ${isFixedM(m) ? '' : 'selected'}>%</option><option value="amount" ${isFixedM(m) ? 'selected' : ''}>$</option>`;
+  // Apply an edit to a milestone: field is name, basis, value or mode. Switching mode keeps the typed number.
+  function editMilestone(m, field, raw, row) {
+    if (field === 'value') { const v = parseFloat(raw) || 0; if (isFixedM(m)) m.amount = v; else m.percent = v; }
+    else if (field === 'mode') {
+      m.mode = raw;
+      const v = parseFloat(row.querySelector('[data-sk="value"], [data-ck="value"]').value) || 0;
+      if (raw === 'amount') m.amount = v; else m.percent = v;
+    } else m[field] = raw;
+  }
   const basisOptions = (sel) => Object.entries(D.BASIS_LABEL).map(([k, l]) => `<option value="${k}" ${k === (sel || 'all') ? 'selected' : ''}>${l}</option>`).join('');
 
   function schedHTML() {
@@ -1218,12 +1234,12 @@
     return `
       <div class="p-h"><span>Payment schedule</span><span class="sched-tools"><button type="button" class="link small" data-act="scheddefault">Reset to company schedule</button><button type="button" class="link small" data-act="schedclear">Remove</button></span></div>
       <table class="p-items edit-sched-t">
-        <thead><tr><th>Milestone</th><th>Applies to</th><th class="p-num">%</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
+        <thead><tr><th>Milestone</th><th>Applies to</th><th class="p-num">Percent or $</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
         <tbody>${s.map((m, i) => `
           <tr data-si="${i}">
             <td><input class="ghost" data-sk="name" value="${esc(m.name)}" placeholder="e.g. Deposit, due on start day" aria-label="Milestone name"></td>
             <td><select class="ghost" data-sk="basis" aria-label="Applies to">${basisOptions(m.basis)}</select></td>
-            <td class="p-num"><input class="ghost r pct" type="number" step="0.01" min="0" max="100" data-sk="percent" value="${Number(m.percent) || 0}" aria-label="Percent"></td>
+            <td class="p-num"><span class="valcell"><input class="ghost r pct" type="number" step="0.01" min="0" data-sk="value" value="${valueOf(m)}" aria-label="Percent or dollar amount"><select class="ghost xs" data-sk="mode" aria-label="Percent or fixed dollar amount">${modeOptions(m)}</select></span></td>
             <td class="p-num" data-samt="${i}"></td>
             <td class="p-num"><button type="button" class="x" data-act="rmsched" data-i="${i}" aria-label="Remove milestone">×</button></td>
           </tr>`).join('')}</tbody>
@@ -1241,7 +1257,7 @@
       <ul class="ms">${rows.map((m, i) => {
         const inv = milestoneInv(d.id, i);
         return `<li>
-          <div><b>${esc(m.name || 'Payment ' + (i + 1))}</b><span class="sub">${D.num(m.percent)}%${m.basis !== 'all' ? ' of ' + D.BASIS_LABEL[m.basis].toLowerCase() : ''}, ${money(m.amount)}</span></div>
+          <div><b>${esc(m.name || 'Payment ' + (i + 1))}</b><span class="sub">${esc(D.shareLabel(m))}, ${money(m.amount)}</span></div>
           ${inv ? `<a class="ms-inv" href="#/doc/${inv.id}">${esc(inv.number)} ${pill(status(inv))}</a>` : `<button class="btn" data-act="msinvoice" data-i="${i}">Create invoice</button>`}
         </li>`;
       }).join('')}</ul>
@@ -1260,7 +1276,7 @@
     const taxNote = totals(est).tax ? ', tax included' : '';
     const inv = {
       ...docFields(est), type: 'invoice', status: 'draft', number: predictNumber(co, 'invoice'), issue_date: today(), due_date: today(),
-      items: [{ kind: 'Service', description: `${m.name || 'Payment ' + (i + 1)}\n${D.num(m.percent)}% of ${of} for estimate ${est.number}${est.job_title ? ', ' + est.job_title : ''}${taxNote}`, qty: 1, price: m.amount }],
+      items: [{ kind: 'Service', description: `${m.name || 'Payment ' + (i + 1)}\n${m.mode === 'amount' ? 'Fixed payment' : `${D.num(m.percent)}% of ${m.afterFixed ? (m.basis === 'all' ? 'the balance after fixed payments' : of + ' after fixed payments') : of}`} for estimate ${est.number}${est.job_title ? ', ' + est.job_title : ''}${m.mode === 'amount' ? '' : taxNote}`, qty: 1, price: m.amount }],
       tax_rate: 0, discount_type: 'percent', discount_value: 0, notes: '', terms: co.default_terms || '', amount_paid: 0, total: m.amount,
       source_id: est.id, milestone_index: i, milestone_name: m.name || '', show_photos: false, schedule: []
     };
@@ -1281,7 +1297,7 @@
         <tr data-ci="${i}">
           <td><input data-ck="name" value="${esc(m.name)}" placeholder="e.g. Deposit, due on start day" aria-label="Milestone name"></td>
           <td><select data-ck="basis" aria-label="Applies to">${basisOptions(m.basis)}</select></td>
-          <td class="n"><input data-ck="percent" type="number" step="0.01" min="0" max="100" value="${Number(m.percent) || 0}" aria-label="Percent" class="pct-in"></td>
+          <td class="n"><span class="valcell"><input data-ck="value" type="number" step="0.01" min="0" value="${valueOf(m)}" aria-label="Percent or dollar amount" class="pct-in"><select data-ck="mode" aria-label="Percent or fixed dollar amount" class="mode-in">${modeOptions(m)}</select></span></td>
           <td class="n"><button type="button" class="x" data-crm="${i}" aria-label="Remove milestone">×</button></td>
         </tr>`).join('') : '<tr class="none"><td colspan="4">No milestones yet. Pick a quick start or add one.</td></tr>';
       warn();
@@ -1291,7 +1307,7 @@
       const tr = e.target.closest('tr[data-ci]');
       if (!tr || !e.target.dataset.ck) return;
       const k = e.target.dataset.ck;
-      sched[+tr.dataset.ci][k] = k === 'percent' ? parseFloat(e.target.value) || 0 : e.target.value;
+      editMilestone(sched[+tr.dataset.ci], k, e.target.value, tr);
       warn();
     };
     box.addEventListener('input', onEdit);
@@ -1300,7 +1316,7 @@
     $('#coSchedAdd').onclick = () => { sched.push({ name: '', percent: 0, basis: 'all' }); draw(); };
     $$('[data-preset]').forEach((b) => (b.onclick = () => { sched = clone(PRESETS[b.dataset.preset].list); draw(); }));
     draw();
-    return () => sched.filter((m) => m.name || Number(m.percent));
+    return () => sched.filter((m) => m.name || valueOf(m));
   }
 
   // ---------------- Price book ----------------
@@ -1744,10 +1760,10 @@
         </section>
         <section>
           <h2>Deposits and payment schedule</h2>
-          <p class="sub">Split each job into payments at milestones. Each payment is a percentage of the whole job, of labor and services only, or of materials only. That lets you, for example, collect materials before ordering and split the labor 50 / 25 / 25.</p>
+          <p class="sub">Split each job into payments at milestones. Each payment is either a fixed dollar amount (pick <b>$</b>), such as a $500 booking deposit, or a percentage (pick <b>%</b>) of the whole job, of labor and services only, or of materials only. Fixed amounts come off the top, and percentages split what's left.</p>
           <label class="check"><input type="checkbox" id="useSched" ${c.use_schedule ? 'checked' : ''}> Require a deposit: add this schedule to every new estimate</label>
           <div class="presets"><span class="sub">Quick start:</span>${Object.entries(PRESETS).map(([k, p]) => `<button type="button" class="btn subtle" data-preset="${k}">${p.label}</button>`).join('')}</div>
-          <div class="tbl-wrap"><table class="tbl sched-tbl"><thead><tr><th>Milestone</th><th>Applies to</th><th class="n">%</th><th><span class="vh">Remove</span></th></tr></thead><tbody id="coSched"></tbody></table></div>
+          <div class="tbl-wrap"><table class="tbl sched-tbl"><thead><tr><th>Milestone</th><th>Applies to</th><th class="n">Percent or $</th><th><span class="vh">Remove</span></th></tr></thead><tbody id="coSched"></tbody></table></div>
           <div class="sched-foot"><button type="button" class="btn subtle" id="coSchedAdd">Add milestone</button><span class="sched-warn" id="coSchedWarn"></span></div>
           <p class="sub">You can still change the schedule on any estimate. When a milestone is reached, open the estimate and click <b>Create invoice</b> next to that payment.</p>
         </section>

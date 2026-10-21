@@ -48,37 +48,63 @@
     const materials = round2(mat * r);
     return { all: t.total, materials, labor: round2(t.total - materials) };
   }
+  // Milestones are either a fixed dollar amount or a percentage. Fixed amounts come off the top;
+  // percentages are shares of what's left (in the same "applies to" group).
+  const isFixed = (m) => m.mode === 'amount';
   function scheduleAmounts(doc) {
     const b = bases(doc);
-    const out = (doc.schedule || []).map((m) => {
-      const basis = BASIS_LABEL[m.basis] ? m.basis : 'all';
-      const percent = Number(m.percent) || 0;
-      return { name: m.name || '', basis, percent, amount: round2((b[basis] * percent) / 100) };
-    });
-    // When a group adds up to 100%, the last milestone absorbs rounding so the amounts match the total exactly.
+    const list = (doc.schedule || []).map((m) => ({
+      name: m.name || '',
+      basis: BASIS_LABEL[m.basis] ? m.basis : 'all',
+      mode: isFixed(m) ? 'amount' : 'percent',
+      percent: Number(m.percent) || 0,
+      fixed: round2(Number(m.amount) || 0)
+    }));
+    const rem = {};
     Object.keys(BASIS_LABEL).forEach((k) => {
-      const idx = out.map((m, i) => (m.basis === k ? i : -1)).filter((i) => i >= 0);
+      const fixedSum = list.filter((m) => m.mode === 'amount' && m.basis === k).reduce((s, m) => s + m.fixed, 0);
+      rem[k] = Math.max(0, round2(b[k] - fixedSum));
+    });
+    const out = list.map((m) => ({ ...m, afterFixed: list.some((x) => x.mode === 'amount' && x.basis === m.basis),
+      amount: m.mode === 'amount' ? m.fixed : round2((rem[m.basis] * m.percent) / 100) }));
+    // When a group's percentages add up to 100%, the last one absorbs rounding so amounts match exactly.
+    Object.keys(BASIS_LABEL).forEach((k) => {
+      const idx = out.map((m, i) => (m.basis === k && m.mode === 'percent' ? i : -1)).filter((i) => i >= 0);
       if (!idx.length) return;
       const pct = idx.reduce((s, i) => s + out[i].percent, 0);
       if (Math.abs(pct - 100) < 0.001) {
         const others = idx.slice(0, -1).reduce((s, i) => s + out[i].amount, 0);
-        out[idx[idx.length - 1]].amount = round2(b[k] - others);
+        out[idx[idx.length - 1]].amount = round2(rem[k] - others);
       }
     });
     return out;
   }
-  // Returns a warning when the milestones don't cover the job exactly once, otherwise ''.
-  function scheduleCheck(doc, assumeMaterials) {
+  // How a milestone reads on the document and in the app, e.g. "$500.00 fixed" or "50% of the balance".
+  function shareLabel(m) {
+    if (m.mode === 'amount') return 'Fixed amount';
+    const of = m.basis === 'all' ? '' : ' of ' + BASIS_LABEL[m.basis].toLowerCase();
+    return `${num(m.percent)}%${of}${m.afterFixed ? (m.basis === 'all' ? ' of the balance' : ', after fixed payments') : ''}`;
+  }
+  // Returns a warning when the schedule doesn't cover the job exactly, otherwise ''.
+  // On an estimate it compares dollars; on the company profile (no job yet) it checks the percentages.
+  function scheduleCheck(doc, companyLevel) {
     const s = doc.schedule || [];
     if (!s.length) return '';
-    const sum = (k) => s.filter((m) => (m.basis || 'all') === k).reduce((a, m) => a + (Number(m.percent) || 0), 0);
+    if (!companyLevel) {
+      const total = totals(doc).total;
+      const sum = round2(scheduleAmounts(doc).reduce((a, m) => a + m.amount, 0));
+      if (total > 0 && Math.abs(sum - total) > 0.01) return `The payments add up to ${money(sum)}, but the estimate total is ${money(total)}.`;
+      return '';
+    }
+    const pctOf = (k) => s.filter((m) => !isFixed(m) && (m.basis || 'all') === k);
+    const sum = (k) => pctOf(k).reduce((a, m) => a + (Number(m.percent) || 0), 0);
+    if (!pctOf('all').length && !pctOf('labor').length && !pctOf('materials').length) return '';
     const all = sum('all'), lab = sum('labor'), mat = sum('materials');
     const pct = (n) => num(n) + '%';
-    if (!lab && !mat) return Math.abs(all - 100) > 0.01 ? `Milestones add up to ${pct(all)}, not 100%.` : '';
+    if (!pctOf('labor').length && !pctOf('materials').length) return Math.abs(all - 100) > 0.01 ? `The percentages add up to ${pct(all)}, not 100%.` : '';
     const msgs = [];
     if (Math.abs(all + lab - 100) > 0.01) msgs.push(`labor and services add up to ${pct(all + lab)}`);
-    const hasMat = assumeMaterials || bases(doc).materials > 0;
-    if (hasMat && Math.abs(all + mat - 100) > 0.01) msgs.push(`materials add up to ${pct(all + mat)}`);
+    if (pctOf('materials').length && Math.abs(all + mat - 100) > 0.01) msgs.push(`materials add up to ${pct(all + mat)}`);
     return msgs.length ? `Check the percentages: ${msgs.join(' and ')}, not 100%.` : '';
   }
 
@@ -189,10 +215,12 @@
     if (!isInv && (doc.schedule || []).length) {
       const list = scheduleAmounts(doc);
       const showBasis = list.some((m) => m.basis !== 'all');
+      const hasFixed = list.some((m) => m.mode === 'amount') && list.some((m) => m.mode === 'percent');
       sched = {
         thead: `<thead><tr><th>Milestone</th>${showBasis ? '<th>Applies to</th>' : ''}<th class="p-num">Share</th><th class="p-num">Amount</th></tr></thead>`,
-        rows: list.map((m, i) => `<tr><td>${esc(m.name || 'Payment ' + (i + 1))}</td>${showBasis ? `<td>${BASIS_LABEL[m.basis]}</td>` : ''}<td class="p-num">${num(m.percent)}%</td><td class="p-num">${money(m.amount)}</td></tr>`)
+        rows: list.map((m, i) => `<tr><td>${esc(m.name || 'Payment ' + (i + 1))}</td>${showBasis ? `<td>${BASIS_LABEL[m.basis]}</td>` : ''}<td class="p-num">${m.mode === 'amount' ? 'Fixed' : num(m.percent) + '%'}</td><td class="p-num">${money(m.amount)}</td></tr>`)
       };
+      if (hasFixed) sched.rows.push(`<tr class="sched-note"><td colspan="${showBasis ? 4 : 3}">Percentages apply to the balance after fixed payments.</td></tr>`);
     }
     return { co, brand, label, head, thead, rows, bottom, notesBlocks, totalsHtml, sched };
   }
@@ -403,5 +431,5 @@
     return out.toDataURL('image/jpeg', 0.9);
   }
 
-  window.Doc = { esc, nl, money, num, round2, today, addDays, fmtDate, totals, status, STATUS_LABEL, companyLines, renderPaper, buildPages, toPdf, toJpeg, BASIS_LABEL, bases, scheduleAmounts, scheduleCheck };
+  window.Doc = { esc, nl, money, num, round2, today, addDays, fmtDate, totals, status, STATUS_LABEL, companyLines, renderPaper, buildPages, toPdf, toJpeg, BASIS_LABEL, bases, scheduleAmounts, scheduleCheck, shareLabel };
 })();
