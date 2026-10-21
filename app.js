@@ -3,12 +3,19 @@
   const D = window.Doc, Store = window.Store;
   const { esc, money, fmtDate, today, addDays, totals, status, STATUS_LABEL } = D;
   const KINDS = ['Labor', 'Material', 'Service', 'Equipment', 'Subcontract', 'Permit', 'Expense', 'Other'];
+  const UNITS = ['each', 'hour', 'day', 'sq ft', 'linear ft', 'sq yd', 'cu yd', 'lot', 'job'];
   const METHODS = ['Check', 'Cash', 'Zelle', 'Venmo', 'PayPal', 'Bank transfer', 'Card', 'Other'];
   const TRACKED = ['status', 'amount_paid', 'sent_at', 'last_sent_at', 'viewed_at', 'view_count', 'accepted_at', 'accepted_by', 'converted_id', 'archived'];
 
   const S = {
-    mode: null, user: null, companies: [], customers: [], documents: [], payments: [], events: [],
+    mode: null, user: null, companies: [], customers: [], documents: [], payments: [], events: [], items: [], photos: [], needsUpgrade: false,
     filter: localStorage.getItem('folio:company') || 'all', known: new Set(), list: {}, started: false, pendingCustomer: null
+  };
+  // Until upgrade-1.sql is run, leave out the new document fields so saving still works.
+  const baseUpsert = Store.upsert.bind(Store);
+  Store.upsert = (t, o) => {
+    if (S.needsUpgrade && t === 'documents') { o = { ...o }; ['schedule', 'show_photos', 'milestone_index', 'milestone_name'].forEach((k) => delete o[k]); }
+    return baseUpsert(t, o);
   };
   let E = null; // editor state: { doc, isNew, dirty, hash, saveCustomer }
 
@@ -143,7 +150,10 @@
   async function loadAll() {
     const [companies, customers, documents, payments, events] = await Promise.all(
       ['companies', 'customers', 'documents', 'payments', 'events'].map((t) => Store.list(t)));
-    Object.assign(S, { companies, customers, documents, payments, events });
+    // Price book and photos need the database upgrade; keep working without them if it hasn't been run.
+    const optional = await Promise.all(['items', 'photos'].map((t) => Store.list(t).then((r) => r, () => null)));
+    S.needsUpgrade = optional.some((r) => r === null);
+    Object.assign(S, { companies, customers, documents, payments, events, items: optional[0] || [], photos: optional[1] || [] });
   }
 
   async function startApp() {
@@ -175,6 +185,9 @@
     document.addEventListener('click', (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenus(); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenus(); });
     window.addEventListener('hashchange', route);
+    v.addEventListener('keydown', (e) => { if (sug && e.target === sug.el) suggestKey(e); });
+    v.addEventListener('focusout', (e) => { if (sug && e.target === sug.el) setTimeout(closeSuggest, 150); });
+    window.addEventListener('scroll', () => closeSuggest(), true);
     window.addEventListener('beforeunload', (e) => { if (E && E.dirty) { e.preventDefault(); e.returnValue = ''; } });
   }
 
@@ -188,6 +201,9 @@
       ? `<span class="demo-tag">Demo mode</span><p>Data is saved in this browser only. Connect a backend to sign in anywhere and email customers.</p>`
       : `<p>${esc(S.user && S.user.email)}</p>`;
     renderBell();
+    const bn = $('#banner');
+    bn.hidden = !S.needsUpgrade;
+    bn.innerHTML = 'Folio was updated. Run <b>upgrade-1.sql</b> in Supabase (SQL Editor) to turn on the price book, payment schedules and photos.';
   }
 
   function unread() { return S.events.filter((e) => !e.seen && (e.kind === 'viewed' || e.kind === 'accepted') && docById(e.document_id)); }
@@ -294,6 +310,7 @@
     }
     E = null;
     closeMenus();
+    closeSuggest();
     const [p, a] = (location.hash.replace(/^#\/?/, '') || 'dashboard').split('/');
     if (!S.companies.length && !['company', 'settings'].includes(p)) { location.replace('#/company/new'); return; }
     const v = $('#view');
@@ -314,6 +331,7 @@
       case 'companies': return vCompanies(v);
       case 'company': return vCompany(v, a);
       case 'settings': return vSettings(v);
+      case 'pricebook': return vPriceBook(v);
       default: location.replace('#/dashboard');
     }
   }
@@ -474,7 +492,8 @@
   function docFields(d) {
     const o = {};
     ['company_id', 'customer_id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address', 'job_title', 'job_site',
-      'tax_rate', 'discount_type', 'discount_value', 'notes', 'terms', 'total'].forEach((k) => (o[k] = d[k] ?? null));
+      'tax_rate', 'discount_type', 'discount_value', 'notes', 'terms', 'total', 'show_photos'].forEach((k) => (o[k] = d[k] ?? null));
+    o.show_photos = o.show_photos !== false;
     o.items = clone(d.items || []);
     return o;
   }
@@ -511,7 +530,8 @@
     const co = company(d.company_id);
     const copy = {
       ...docFields(d), type: d.type, status: 'draft', number: predictNumber(co, d.type), issue_date: today(),
-      due_date: addDays(today(), d.type === 'invoice' ? (co.payment_terms_days ?? 30) : (co.estimate_valid_days ?? 30)), amount_paid: 0
+      due_date: addDays(today(), d.type === 'invoice' ? (co.payment_terms_days ?? 30) : (co.estimate_valid_days ?? 30)), amount_paid: 0,
+      schedule: d.type === 'estimate' ? clone(d.schedule || []) : []
     };
     try {
       const saved = await createDoc(copy);
@@ -557,7 +577,9 @@
   async function del(d) {
     if (!confirm(`Delete ${typeName(d).toLowerCase()} ${d.number}? Its payments and activity are deleted too. This can't be undone.`)) return;
     try {
+      for (const p of photosFor(d.id)) { try { await Store.removePhotoFile(p.path); } catch (e) { /* keep going */ } }
       await Store.remove('documents', d.id);
+      S.photos = S.photos.filter((p) => p.document_id !== d.id);
       S.documents = S.documents.filter((x) => x.id !== d.id);
       S.payments = S.payments.filter((p) => p.document_id !== d.id);
       S.events = S.events.filter((e) => e.document_id !== d.id);
@@ -577,12 +599,12 @@
   async function download(d, fmt) {
     toast(fmt === 'pdf' ? 'Preparing PDF' : 'Preparing image', { ms: 1600 });
     try {
-      const html = D.renderPaper(d, company(d.company_id));
+      const args = [d, company(d.company_id), photosFor(d.id)];
       if (fmt === 'pdf') {
-        (await D.toPdf(html)).save(fileName(d) + '.pdf');
+        (await D.toPdf(...args)).save(fileName(d) + '.pdf');
       } else {
         const a = document.createElement('a');
-        a.href = await D.toJpeg(html);
+        a.href = await D.toJpeg(...args);
         a.download = fileName(d) + '.jpg';
         a.click();
       }
@@ -593,8 +615,17 @@
     modal(`
       <div class="pv-head"><h2>${typeName(d)} ${esc(d.number)}</h2>
         <div class="btn-row"><button class="btn" id="pvPdf">Download PDF</button><button class="btn" id="pvJpg">Download JPEG</button><button class="btn" data-close>Close</button></div></div>
-      <div class="pv-body">${D.renderPaper(d, company(d.company_id))}</div>`, (w) => {
+      <p class="sub">Exactly as it prints and downloads, page by page.</p>
+      <div class="pv-body pv-pages"><p class="sub">Laying out pages</p></div>`, async (w) => {
       $('#pvPdf', w).onclick = () => download(d, 'pdf');
+      try {
+        const pages = await D.buildPages(d, company(d.company_id), photosFor(d.id));
+        const body = $('.pv-body', w);
+        body.innerHTML = pages.map((pg) => `<div class="pv-page">${pg}</div>`).join('');
+        const fit = () => { const s = Math.min(1, (body.clientWidth - 2) / 816); $$('.pv-page', w).forEach((el) => { el.style.setProperty('--s', s); }); };
+        fit();
+        window.addEventListener('resize', fit);
+      } catch (e) { $('.pv-body', w).innerHTML = `<p class="err">${esc(e.message)}</p>`; }
       $('#pvJpg', w).onclick = () => download(d, 'jpeg');
     }, 'wide');
   }
@@ -695,7 +726,7 @@
         try {
           let pdf_base64 = null;
           if ($('#sAtt', w).checked) {
-            const pdf = await D.toPdf(D.renderPaper(d, co));
+            const pdf = await D.toPdf(d, co, photosFor(d.id));
             pdf_base64 = pdf.output('datauristring').split(',')[1];
           }
           await Store.send({ document_id: d.id, to, subject: val('#sSub'), message: $('#sMsg', w).value, kind, pdf_base64, filename: fileName(d) + '.pdf' });
@@ -766,7 +797,8 @@
       customer_name: '', customer_email: '', customer_phone: '', customer_address: '', job_title: '', job_site: '',
       items: [{ kind: 'Labor', description: '', qty: 1, price: 0, }],
       tax_rate: Number(co.tax_rate) || 0, discount_type: 'percent', discount_value: 0,
-      notes: co.default_notes || '', terms: co.default_terms || '', amount_paid: 0
+      notes: co.default_notes || '', terms: co.default_terms || '', amount_paid: 0, show_photos: true,
+      schedule: type === 'estimate' && co.use_schedule ? clone(co.default_schedule || []) : []
     };
     const c = S.pendingCustomer && S.customers.find((x) => x.id === S.pendingCustomer);
     S.pendingCustomer = null;
@@ -829,12 +861,14 @@
           <button class="btn" data-act="download">Download</button>
           <button class="btn" data-act="send">${d.sent_at ? 'Send again' : 'Send'}</button>
           ${inv ? '<button class="btn" data-act="pay">Record payment</button>'
+        : (d.schedule || []).length ? '<button class="btn" data-act="nextms">Invoice next payment</button>'
         : `<button class="btn" data-act="convert">${d.converted_id ? 'Open invoice' : 'Convert to invoice'}</button>`}
           ${E.isNew ? '' : '<button class="btn icon" data-act="more" aria-label="More actions">•••</button>'}
           <button class="btn primary" data-act="save">${E.dirty ? 'Save changes' : 'Save'}</button>
         </div>
       </div>
       <div class="ed-grid">
+        <div class="ed-main">
         <form class="paper edit" style="--brand:${esc(co.color || '#1F4E46')}" onsubmit="return false" autocomplete="off">
           <div class="p-band"></div>
           <header class="p-head">
@@ -876,7 +910,7 @@
             <thead><tr><th>Description</th><th class="p-num">Rate</th><th class="p-num">Qty</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
             <tbody id="itemRows">${itemRows()}</tbody>
           </table>
-          <button type="button" class="btn subtle add-line" data-act="addline">Add line item</button>
+          <div class="line-btns"><button type="button" class="btn subtle" data-act="addline">Add line item</button><button type="button" class="btn subtle" data-act="pbpick">Add from price book</button></div>
           <section class="p-bottom">
             <div class="p-notes stack">
               <div class="p-h">Notes</div>
@@ -895,7 +929,10 @@
               <div class="tr due"><span>${inv ? 'Balance due' : 'Estimate total'}</span><span id="tBal"></span></div>
             </div>
           </section>
+          ${inv ? '' : `<section class="p-sched edit-sched" id="schedBox">${schedHTML()}</section>`}
         </form>
+        <section class="ph-box" id="photoBox">${photosHTML()}</section>
+        </div>
         <aside class="rail" id="rail">${railHTML()}</aside>
       </div>`;
     autosizeAll();
@@ -908,10 +945,10 @@
     return items.map((it, i) => `
       <tr data-i="${i}">
         <td>
-          <select class="ghost kind" data-k="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
+          <div class="li-top"><select class="ghost kind" data-k="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select><button type="button" class="link tiny-link" data-act="pbsave" data-i="${i}">Save to price book</button></div>
           <textarea class="desc" data-k="description" rows="2" placeholder="Describe the work or material" aria-label="Description"${it.h ? ` style="height:${Number(it.h)}px"` : ''}>${esc(it.description)}</textarea>
         </td>
-        <td class="p-num"><input class="ghost r rate" type="number" step="0.01" min="0" data-k="price" value="${it.price ?? ''}" aria-label="Rate"></td>
+        <td class="p-num"><input class="ghost r rate" type="number" step="0.01" min="0" data-k="price" value="${it.price ?? ''}" aria-label="Rate"><input class="ghost r unit" data-k="unit" list="unitList" placeholder="unit" value="${esc(it.unit || '')}" aria-label="Unit, for example hour or sq ft"></td>
         <td class="p-num"><input class="ghost r qty" type="number" step="any" min="0" data-k="qty" value="${it.qty ?? ''}" aria-label="Quantity"></td>
         <td class="p-num amt" data-amt="${i}"></td>
         <td class="p-num"><button type="button" class="x" data-act="rmline" data-i="${i}" aria-label="Remove line">×</button></td>
@@ -932,6 +969,10 @@
       const el = $(`[data-amt="${i}"]`);
       if (el) el.textContent = money((Number(it.qty) || 0) * (Number(it.price) || 0));
     });
+    if ((E.doc.schedule || []).length) {
+      D.scheduleAmounts(E.doc).forEach((m, i) => { const el = $(`[data-samt="${i}"]`); if (el) el.textContent = money(m.amount); });
+      const w = $('#schedWarn'); if (w) w.textContent = D.scheduleCheck(E.doc);
+    }
   }
 
   function markDirty() {
@@ -943,18 +984,29 @@
 
   function onEdInput(ev) {
     const el = ev.target;
+    if (!el.isConnected) return; // ignore late events from a field that was just redrawn
     if (el.id === 'custPick') { if (ev.type === 'change') pickCustomer(el.value); return; }
     if (el.id === 'saveCust') { E.saveCustomer = el.checked; return; }
+    if (el.id === 'phIn' || el.id === 'phCam') { if (ev.type === 'change') { const files = [...el.files]; el.value = ''; uploadPhotos(files); } return; }
+    if (el.dataset.pc) { if (ev.type === 'change') savePhotoCaption(el.dataset.pc, el.value); return; }
+    const sr = el.closest('tr[data-si]');
+    if (el.dataset.sk && sr) {
+      const m = E.doc.schedule[+sr.dataset.si];
+      m[el.dataset.sk] = el.dataset.sk === 'percent' ? parseFloat(el.value) || 0 : el.value;
+      markDirty(); updateTotals();
+      return;
+    }
     const tr = el.closest('tr[data-i]');
     if (el.dataset.k && tr) {
       const it = E.doc.items[+tr.dataset.i];
       const k = el.dataset.k;
       it[k] = el.type === 'checkbox' ? el.checked : (k === 'qty' || k === 'price' ? parseFloat(el.value) || 0 : el.value);
       if (el.tagName === 'TEXTAREA') autosize(el);
+      if (el.classList.contains('desc') && ev.type === 'input') showSuggest(el);
     } else if (el.dataset.f) {
       const f = el.dataset.f;
       if (f === 'company_id') { if (ev.type === 'change') changeCompany(el.value); return; }
-      E.doc[f] = ['discount_value', 'tax_rate'].includes(f) ? parseFloat(el.value) || 0 : el.value;
+      E.doc[f] = el.type === 'checkbox' ? el.checked : ['discount_value', 'tax_rate'].includes(f) ? parseFloat(el.value) || 0 : el.value;
       if (el.tagName === 'TEXTAREA') autosize(el);
     } else return;
     markDirty();
@@ -1027,6 +1079,36 @@
   async function ensureSaved() { return (E.isNew || E.dirty) ? saveDoc(true) : true; }
 
   const ACTS = {
+    pbpick: () => pickItemsModal(),
+    pbsave: (b) => {
+      const it = E.doc.items[+b.dataset.i];
+      const [first, ...rest] = String(it.description || '').split('\n');
+      itemModal(null, { name: first.trim(), description: rest.join('\n').trim(), kind: it.kind, price: it.price, unit: it.unit || '', company_id: null });
+    },
+    addsched: () => {
+      E.doc.schedule = E.doc.schedule || [];
+      const used = E.doc.schedule.reduce((s, m) => s + (m.basis === 'all' ? Number(m.percent) || 0 : 0), 0);
+      E.doc.schedule.push({ name: '', percent: Math.max(0, 100 - used), basis: 'all' });
+      markDirty(); redrawSched();
+    },
+    rmsched: (b) => { E.doc.schedule.splice(+b.dataset.i, 1); markDirty(); redrawSched(); },
+    scheddefault: () => {
+      const co = company(E.doc.company_id) || {};
+      E.doc.schedule = (co.default_schedule || []).length ? clone(co.default_schedule) : clone(PRESETS.b.list);
+      markDirty(); redrawSched();
+    },
+    schedclear: () => { E.doc.schedule = []; markDirty(); redrawSched(); },
+    msinvoice: async (b) => { if (await ensureSaved()) milestoneInvoice(docById(E.doc.id), +b.dataset.i); },
+    nextms: async () => {
+      if (!(await ensureSaved())) return;
+      const d = docById(E.doc.id);
+      const i = D.scheduleAmounts(d).findIndex((m, idx) => !milestoneInv(d.id, idx));
+      if (i < 0) { toast('Every payment in the schedule already has an invoice.'); return; }
+      milestoneInvoice(d, i);
+    },
+    phdel: (b) => deletePhoto(b.dataset.id),
+    phdl: (b) => downloadPhoto(b.dataset.id),
+    phzip: () => downloadAllPhotos(),
     save: () => saveDoc(),
     addline: () => {
       E.doc.items.push({ kind: 'Labor', description: '', qty: 1, price: 0, });
@@ -1090,6 +1172,7 @@
         ${conv ? `<p class="sub">Converted to <a href="#/doc/${conv.id}">invoice ${esc(conv.number)}</a></p>` : ''}
         ${inv && d.sent_at && t.balance > 0 ? '<button class="btn wide" data-act="remind">Send payment reminder</button>' : ''}
       </div>
+      ${!inv && (d.schedule || []).length ? scheduleRail(d) : ''}
       <div class="rail-box">
         <h3>Customer link</h3>
         <p class="sub">Your customer can view${inv ? '' : ' and accept'} this ${d.type} online. You're notified when they open it.</p>
@@ -1105,6 +1188,414 @@
         <h3>Activity</h3>
         ${evs.length ? `<ul class="feed small">${evs.map((e) => `<li class="k-${e.kind}"><span>${esc(eventText(e))}</span><span class="sub">${ago(e.created_at)}</span></li>`).join('')}</ul>` : '<p class="sub">Nothing yet.</p>'}
       </div>`;
+  }
+
+  // ---------------- Payment schedules ----------------
+  const PRESETS = {
+    a: { label: '50% start, 50% completion', list: [
+      { name: 'Deposit, due on start day', percent: 50, basis: 'all' },
+      { name: 'Balance at completion', percent: 50, basis: 'all' }] },
+    b: { label: '50 / 25 / 25', list: [
+      { name: 'Deposit, due on start day', percent: 50, basis: 'all' },
+      { name: 'After rough-in', percent: 25, basis: 'all' },
+      { name: 'At completion', percent: 25, basis: 'all' }] },
+    c: { label: 'Materials upfront, labor 50 / 25 / 25', list: [
+      { name: 'Materials, due before ordering', percent: 100, basis: 'materials' },
+      { name: 'Labor deposit, on start day', percent: 50, basis: 'labor' },
+      { name: 'After rough-in', percent: 25, basis: 'labor' },
+      { name: 'At completion', percent: 25, basis: 'labor' }] }
+  };
+  const basisOptions = (sel) => Object.entries(D.BASIS_LABEL).map(([k, l]) => `<option value="${k}" ${k === (sel || 'all') ? 'selected' : ''}>${l}</option>`).join('');
+
+  function schedHTML() {
+    const d = E.doc;
+    const s = d.schedule || [];
+    const co = company(d.company_id) || {};
+    if (!s.length) {
+      return `<div class="p-h"><span>Payment schedule</span></div>
+        <p class="sched-empty">No payment schedule on this estimate. <button type="button" class="link small" data-act="scheddefault">${(co.default_schedule || []).length ? 'Add your company schedule' : 'Add a schedule'}</button></p>`;
+    }
+    return `
+      <div class="p-h"><span>Payment schedule</span><span class="sched-tools"><button type="button" class="link small" data-act="scheddefault">Reset to company schedule</button><button type="button" class="link small" data-act="schedclear">Remove</button></span></div>
+      <table class="p-items edit-sched-t">
+        <thead><tr><th>Milestone</th><th>Applies to</th><th class="p-num">%</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
+        <tbody>${s.map((m, i) => `
+          <tr data-si="${i}">
+            <td><input class="ghost" data-sk="name" value="${esc(m.name)}" placeholder="e.g. Deposit, due on start day" aria-label="Milestone name"></td>
+            <td><select class="ghost" data-sk="basis" aria-label="Applies to">${basisOptions(m.basis)}</select></td>
+            <td class="p-num"><input class="ghost r pct" type="number" step="0.01" min="0" max="100" data-sk="percent" value="${Number(m.percent) || 0}" aria-label="Percent"></td>
+            <td class="p-num" data-samt="${i}"></td>
+            <td class="p-num"><button type="button" class="x" data-act="rmsched" data-i="${i}" aria-label="Remove milestone">×</button></td>
+          </tr>`).join('')}</tbody>
+      </table>
+      <div class="sched-foot"><button type="button" class="btn subtle" data-act="addsched">Add milestone</button><span class="sched-warn" id="schedWarn"></span></div>`;
+  }
+  function redrawSched() { const b = $('#schedBox'); if (b) b.innerHTML = schedHTML(); updateTotals(); }
+
+  const milestoneInv = (estId, i) => S.documents.find((x) => x.type === 'invoice' && x.source_id === estId && Number(x.milestone_index) === i);
+
+  function scheduleRail(d) {
+    const rows = D.scheduleAmounts(d);
+    return `<div class="rail-box">
+      <h3>Payment schedule</h3>
+      <ul class="ms">${rows.map((m, i) => {
+        const inv = milestoneInv(d.id, i);
+        return `<li>
+          <div><b>${esc(m.name || 'Payment ' + (i + 1))}</b><span class="sub">${D.num(m.percent)}%${m.basis !== 'all' ? ' of ' + D.BASIS_LABEL[m.basis].toLowerCase() : ''}, ${money(m.amount)}</span></div>
+          ${inv ? `<a class="ms-inv" href="#/doc/${inv.id}">${esc(inv.number)} ${pill(status(inv))}</a>` : `<button class="btn" data-act="msinvoice" data-i="${i}">Create invoice</button>`}
+        </li>`;
+      }).join('')}</ul>
+      ${E.dirty ? '<p class="sub">Save your changes before creating invoices.</p>' : ''}
+    </div>`;
+  }
+
+  async function milestoneInvoice(est, i) {
+    const m = D.scheduleAmounts(est)[i];
+    if (!m) return;
+    const existing = milestoneInv(est.id, i);
+    if (existing) return go('#/doc/' + existing.id);
+    if (!(m.amount > 0)) { toast('This payment works out to $0. Check the line items and percentages.', { type: 'error' }); return; }
+    const co = company(est.company_id) || {};
+    const of = m.basis === 'all' ? 'the total' : D.BASIS_LABEL[m.basis].toLowerCase();
+    const taxNote = totals(est).tax ? ', tax included' : '';
+    const inv = {
+      ...docFields(est), type: 'invoice', status: 'draft', number: predictNumber(co, 'invoice'), issue_date: today(), due_date: today(),
+      items: [{ kind: 'Service', description: `${m.name || 'Payment ' + (i + 1)}\n${D.num(m.percent)}% of ${of} for estimate ${est.number}${est.job_title ? ', ' + est.job_title : ''}${taxNote}`, qty: 1, price: m.amount }],
+      tax_rate: 0, discount_type: 'percent', discount_value: 0, notes: '', terms: co.default_terms || '', amount_paid: 0, total: m.amount,
+      source_id: est.id, milestone_index: i, milestone_name: m.name || '', show_photos: false, schedule: []
+    };
+    try {
+      const saved = await createDoc(inv);
+      if (E) E.dirty = false;
+      toast(`Invoice ${saved.number} created for ${m.name || 'payment ' + (i + 1)}`);
+      go('#/doc/' + saved.id);
+    } catch (e) { toast('Could not create the invoice: ' + e.message, { type: 'error', ms: 8000 }); }
+  }
+
+  // Company form: default schedule editor
+  function companySchedule(c) {
+    let sched = clone(c.default_schedule || []);
+    const box = $('#coSched');
+    const draw = () => {
+      box.innerHTML = sched.length ? sched.map((m, i) => `
+        <tr data-ci="${i}">
+          <td><input data-ck="name" value="${esc(m.name)}" placeholder="e.g. Deposit, due on start day" aria-label="Milestone name"></td>
+          <td><select data-ck="basis" aria-label="Applies to">${basisOptions(m.basis)}</select></td>
+          <td class="n"><input data-ck="percent" type="number" step="0.01" min="0" max="100" value="${Number(m.percent) || 0}" aria-label="Percent" class="pct-in"></td>
+          <td class="n"><button type="button" class="x" data-crm="${i}" aria-label="Remove milestone">×</button></td>
+        </tr>`).join('') : '<tr class="none"><td colspan="4">No milestones yet. Pick a quick start or add one.</td></tr>';
+      warn();
+    };
+    const warn = () => { $('#coSchedWarn').textContent = D.scheduleCheck({ schedule: sched, items: [] }, true); };
+    const onEdit = (e) => {
+      const tr = e.target.closest('tr[data-ci]');
+      if (!tr || !e.target.dataset.ck) return;
+      const k = e.target.dataset.ck;
+      sched[+tr.dataset.ci][k] = k === 'percent' ? parseFloat(e.target.value) || 0 : e.target.value;
+      warn();
+    };
+    box.addEventListener('input', onEdit);
+    box.addEventListener('change', onEdit);
+    box.addEventListener('click', (e) => { const b = e.target.closest('[data-crm]'); if (b) { sched.splice(+b.dataset.crm, 1); draw(); } });
+    $('#coSchedAdd').onclick = () => { sched.push({ name: '', percent: 0, basis: 'all' }); draw(); };
+    $$('[data-preset]').forEach((b) => (b.onclick = () => { sched = clone(PRESETS[b.dataset.preset].list); draw(); }));
+    draw();
+    return () => sched.filter((m) => m.name || Number(m.percent));
+  }
+
+  // ---------------- Price book ----------------
+  const itemsFor = (companyId) => S.items.filter((it) => !it.company_id || it.company_id === companyId);
+  const unitText = (it) => (it.unit ? ' / ' + esc(it.unit) : '');
+
+  function vPriceBook(v) {
+    if (S.needsUpgrade) {
+      v.innerHTML = '<div class="head"><h1>Price book</h1></div><p class="lead">Run <b>upgrade-1.sql</b> in Supabase (SQL Editor) to turn on the price book.</p>';
+      return;
+    }
+    v.innerHTML = `
+      <div class="head">
+        <div><h1>Price book</h1><p class="lead">Save the work and materials you price often. In any estimate or invoice, start typing in a description to pull them in.</p></div>
+        <button class="btn primary" id="addItem">Add item</button>
+      </div>
+      <div class="filters">
+        <input type="search" id="pq" placeholder="Search the price book" aria-label="Search">
+        <select id="pk" aria-label="Type"><option value="">All types</option>${KINDS.map((k) => `<option>${k}</option>`).join('')}</select>
+      </div>
+      <div class="tbl-wrap"><table class="tbl" id="ptbl"></table></div>`;
+    const multi = S.companies.length > 1;
+    const draw = () => {
+      const q = $('#pq').value.trim().toLowerCase(), k = $('#pk').value;
+      const list = S.items.filter((it) => (!k || it.kind === k) && (!q || [it.name, it.description].join(' ').toLowerCase().includes(q)))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      $('#ptbl').innerHTML = `
+        <thead><tr><th>Item</th><th>Type</th>${multi ? '<th>Company</th>' : ''}<th class="n">Rate</th></tr></thead>
+        <tbody>${list.map((it) => `
+          <tr data-id="${it.id}">
+            <td><b>${esc(it.name)}</b>${it.description ? `<div class="sub clamp">${esc(it.description)}</div>` : ''}</td>
+            <td>${esc(it.kind || '')}</td>
+            ${multi ? `<td class="sub">${it.company_id ? esc((company(it.company_id) || {}).name || '') : 'All companies'}</td>` : ''}
+            <td class="n num">${money(it.price)}${unitText(it)}</td>
+          </tr>`).join('') || `<tr class="none"><td colspan="4">${S.items.length ? 'No items match your search.' : 'Your price book is empty. Add your first item, for example "Tiled shower niche".'}</td></tr>`}</tbody>`;
+    };
+    $('#pq').oninput = draw;
+    $('#pk').onchange = draw;
+    $('#addItem').onclick = () => itemModal(null, null, draw);
+    $('#ptbl').onclick = (e) => { const tr = e.target.closest('tr[data-id]'); if (tr) itemModal(S.items.find((x) => x.id === tr.dataset.id), null, draw); };
+    draw();
+  }
+
+  function itemModal(item, prefill, onDone) {
+    if (S.needsUpgrade) { toast('Run upgrade-1.sql in Supabase first to use the price book.', { type: 'error' }); return; }
+    const x = item || prefill || { name: '', kind: 'Labor', unit: '', price: 0, description: '', company_id: null };
+    modal(`
+      <h2>${item ? 'Edit price book item' : 'Add to price book'}</h2>
+      <label>Name<input id="iName" value="${esc(x.name)}" placeholder="e.g. Tiled shower niche"></label>
+      <div class="grid3">
+        <label>Type<select id="iKind">${KINDS.map((k) => `<option ${k === x.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></label>
+        <label>Rate<input id="iPrice" type="number" step="0.01" min="0" value="${Number(x.price) || 0}"></label>
+        <label>Unit<input id="iUnit" list="unitList" value="${esc(x.unit || '')}" placeholder="each, hour, sq ft"></label>
+      </div>
+      <label>Description<span class="hint">Shown under the name on the estimate or invoice. Leave empty to show the name only.</span><textarea id="iDesc" rows="4">${esc(x.description || '')}</textarea></label>
+      ${S.companies.length > 1 ? `<label>Available for<select id="iCo"><option value="">All companies</option>${S.companies.map((c) => `<option value="${c.id}" ${c.id === x.company_id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>` : ''}
+      <div class="m-actions">
+        ${item ? '<button class="btn danger" id="iDel">Delete</button><span class="grow"></span>' : ''}
+        <button class="btn" data-close>Cancel</button><button class="btn primary" id="iSave">${item ? 'Save changes' : 'Save item'}</button>
+      </div>`, (w, close) => {
+      $('#iSave', w).onclick = async () => {
+        const name = $('#iName', w).value.trim();
+        if (!name) { toast('Enter a name for the item.', { type: 'error' }); return; }
+        const obj = { name, kind: $('#iKind', w).value, price: D.round2(parseFloat($('#iPrice', w).value) || 0), unit: $('#iUnit', w).value.trim(),
+          description: $('#iDesc', w).value.trim(), company_id: $('#iCo', w) ? ($('#iCo', w).value || null) : null };
+        if (item) obj.id = item.id;
+        try {
+          const saved = await Store.upsert('items', obj);
+          upsertLocal(S.items, saved);
+          close();
+          toast(item ? `${saved.name} updated` : `${saved.name} saved to your price book`);
+          if (onDone) onDone();
+        } catch (e) { toast('Could not save: ' + e.message, { type: 'error' }); }
+      };
+      if (item) {
+        $('#iDel', w).onclick = async () => {
+          if (!confirm(`Delete "${item.name}" from your price book? Estimates and invoices that already use it are not changed.`)) return;
+          await Store.remove('items', item.id);
+          S.items = S.items.filter((y) => y.id !== item.id);
+          close(); toast('Item deleted');
+          if (onDone) onDone();
+        };
+      }
+    });
+  }
+
+  function lineFromItem(item) {
+    return { kind: item.kind || 'Service', description: item.name + (item.description ? '\n' + item.description : ''), qty: 1, price: Number(item.price) || 0, unit: item.unit || '' };
+  }
+  function redrawLines() { $('#itemRows').innerHTML = itemRows(); autosizeAll(); updateTotals(); }
+
+  function pickItemsModal() {
+    const pool = itemsFor(E.doc.company_id).slice().sort((a, b) => a.name.localeCompare(b.name));
+    if (!pool.length) { itemModal(null); return; }
+    modal(`
+      <h2>Add from price book</h2>
+      <input type="search" id="pkQ" placeholder="Search" aria-label="Search the price book">
+      <div class="pick-list" id="pkList"></div>
+      <div class="m-actions"><span class="sub grow" id="pkCount">Nothing selected</span><button class="btn" data-close>Cancel</button><button class="btn primary" id="pkGo">Add to ${E.doc.type}</button></div>`, (w, close) => {
+      const sel = new Set();
+      const draw = () => {
+        const q = $('#pkQ', w).value.trim().toLowerCase();
+        $('#pkList', w).innerHTML = pool.filter((it) => !q || [it.name, it.description].join(' ').toLowerCase().includes(q)).map((it) => `
+          <label class="pick"><input type="checkbox" value="${it.id}" ${sel.has(it.id) ? 'checked' : ''}>
+            <span class="who"><b>${esc(it.name)}</b>${it.description ? `<span class="sub clamp">${esc(it.description)}</span>` : ''}</span>
+            <span class="num">${money(it.price)}${unitText(it)}</span></label>`).join('') || '<p class="sub">No items match.</p>';
+      };
+      $('#pkQ', w).oninput = draw;
+      $('#pkList', w).onchange = (e) => {
+        if (e.target.checked) sel.add(e.target.value); else sel.delete(e.target.value);
+        $('#pkCount', w).textContent = sel.size ? plural(sel.size, 'item') + ' selected' : 'Nothing selected';
+      };
+      $('#pkGo', w).onclick = () => {
+        if (!sel.size) { toast('Tick the items you want to add.', { type: 'error' }); return; }
+        const lines = E.doc.items;
+        if (lines.length === 1 && !String(lines[0].description || '').trim() && !(Number(lines[0].price) > 0)) lines.pop();
+        pool.filter((it) => sel.has(it.id)).forEach((it) => lines.push(lineFromItem(it)));
+        markDirty(); redrawLines(); close();
+        toast(`${plural(sel.size, 'item')} added`);
+      };
+      draw();
+    }, 'pick-modal');
+  }
+
+  // Suggestions while typing a description
+  let sug = null;
+  function closeSuggest() { if (sug) { sug.box.remove(); sug = null; } }
+  function showSuggest(el) {
+    const q = el.value.trim().toLowerCase();
+    if (!q || q.length < 2 || el.value.includes('\n') || q.length > 60) return closeSuggest();
+    const words = q.split(/\s+/);
+    const list = itemsFor(E.doc.company_id)
+      .filter((it) => { const hay = (it.name + ' ' + (it.description || '')).toLowerCase(); return words.every((w) => hay.includes(w)); })
+      .sort((a, b) => a.name.localeCompare(b.name)).slice(0, 6);
+    closeSuggest();
+    if (!list.length) return;
+    const box = document.createElement('div');
+    box.className = 'suggest';
+    box.setAttribute('role', 'listbox');
+    box.innerHTML = '<div class="sg-head">From your price book</div>' + list.map((it, i) => `
+      <button type="button" role="option" data-sg="${i}" class="${i === 0 ? 'on' : ''}">
+        <span class="who"><b>${esc(it.name)}</b>${it.description ? `<span class="sub">${esc(it.description.split('\n')[0])}</span>` : ''}</span>
+        <span class="num">${money(it.price)}${unitText(it)}</span>
+      </button>`).join('');
+    document.body.appendChild(box);
+    const r = el.getBoundingClientRect();
+    box.style.left = Math.max(8, Math.min(r.left, innerWidth - Math.max(r.width, 340) - 8)) + 'px';
+    box.style.width = Math.min(Math.max(r.width, 340), innerWidth - 16) + 'px';
+    box.style.top = (r.bottom + 4) + 'px';
+    if (r.bottom + 4 + box.offsetHeight > innerHeight - 8) box.style.top = Math.max(8, r.top - box.offsetHeight - 4) + 'px';
+    box.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const b = e.target.closest('[data-sg]');
+      if (b) applyItem(el, list[+b.dataset.sg]);
+    });
+    sug = { el, list, idx: 0, box };
+  }
+  function suggestKey(e) {
+    const btns = $$('[data-sg]', sug.box);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      sug.idx = (sug.idx + (e.key === 'ArrowDown' ? 1 : -1) + btns.length) % btns.length;
+      btns.forEach((b, i) => b.classList.toggle('on', i === sug.idx));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      applyItem(sug.el, sug.list[sug.idx]);
+    } else if (e.key === 'Escape' || e.key === 'Tab') closeSuggest();
+  }
+  function applyItem(el, item) {
+    const tr = el.closest('tr[data-i]');
+    const line = E.doc.items[+tr.dataset.i];
+    const qty = Number(line.qty) > 0 ? line.qty : 1;
+    Object.assign(line, lineFromItem(item), { qty });
+    closeSuggest(); markDirty(); redrawLines();
+  }
+
+  // ---------------- Photos ----------------
+  const photosFor = (docId) => S.photos.filter((p) => p.document_id === docId).sort((a, b) => (a.position || 0) - (b.position || 0) || String(a.created_at).localeCompare(String(b.created_at)));
+
+  function photosHTML() {
+    const d = E.doc;
+    if (S.needsUpgrade) return '<h3>Photos</h3><p class="sub">Run upgrade-1.sql in Supabase to turn on photos.</p>';
+    const ph = d.id ? photosFor(d.id) : [];
+    return `
+      <div class="ph-head">
+        <div><h3>Photos</h3><p class="sub">${ph.length ? plural(ph.length, 'photo') : 'Add photos of the job site or the scope of work. On a phone, you can use the camera.'}</p></div>
+        <div class="btn-row">
+          <label class="btn">Add photos<input type="file" id="phIn" accept="image/*" multiple class="vh"></label>
+          <label class="btn cam">Take photo<input type="file" id="phCam" accept="image/*" capture="environment" class="vh"></label>
+          ${ph.length ? '<button type="button" class="btn" data-act="phzip">Download all</button>' : ''}
+        </div>
+      </div>
+      ${ph.length ? `<label class="check small"><input type="checkbox" data-f="show_photos" ${d.show_photos !== false ? 'checked' : ''}> Show photos to the customer, on their page and in the PDF</label>` : ''}
+      <p class="sub" id="phStatus" aria-live="polite"></p>
+      <div class="ph-grid">${ph.map((p, i) => `
+        <figure>
+          <a href="${esc(p.url)}" target="_blank" rel="noopener"><img src="${esc(p.url)}" alt="${esc(p.caption || 'Photo ' + (i + 1))}" loading="lazy"></a>
+          <input class="ghost cap" data-pc="${p.id}" value="${esc(p.caption || '')}" placeholder="Add a caption" aria-label="Caption for photo ${i + 1}">
+          <div class="ph-act"><button type="button" class="link small" data-act="phdl" data-id="${p.id}">Download</button><button type="button" class="link small danger" data-act="phdel" data-id="${p.id}">Delete</button></div>
+        </figure>`).join('')}</div>`;
+  }
+  function refreshPhotos() { const b = $('#photoBox'); if (b) b.innerHTML = photosHTML(); }
+
+  function resizeImage(file, max, q) {
+    return new Promise((res, rej) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.round(img.naturalWidth * s), h = Math.round(img.naturalHeight * s);
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        c.toBlob((b) => (b ? res({ blob: b, width: w, height: h }) : rej(new Error('The photo could not be processed.'))), 'image/jpeg', q);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); rej(new Error(`${file.name} could not be opened. Try a JPEG or PNG photo.`)); };
+      img.src = url;
+    });
+  }
+
+  async function uploadPhotos(files) {
+    if (!files.length) return;
+    if (!(await ensureSaved())) return;
+    const docId = E.doc.id;
+    let pos = photosFor(docId).reduce((m, p) => Math.max(m, (p.position || 0) + 1), 0);
+    let ok = 0, lastErr = '';
+    const status = (t) => { const s = $('#phStatus'); if (s) s.textContent = t; };
+    for (let n = 0; n < files.length; n++) {
+      status(`Uploading ${n + 1} of ${files.length}`);
+      try {
+        const demo = S.mode === 'demo';
+        const { blob, width, height } = await resizeImage(files[n], demo ? 1000 : 1800, demo ? 0.72 : 0.82);
+        const { path, url } = await Store.uploadPhoto(docId, blob);
+        const row = await Store.upsert('photos', { document_id: docId, path, url, caption: '', position: pos++, width, height });
+        S.photos.push(row);
+      } catch (e) { console.error(e); lastErr = e.message; continue; }
+      ok++;
+    }
+    if (E && E.doc.id === docId) refreshPhotos();
+    if (ok) toast(`${plural(ok, 'photo')} added`);
+    if (lastErr) toast(`${plural(files.length - ok, 'photo')} could not be added: ${lastErr}`, { type: 'error', ms: 9000 });
+  }
+
+  async function savePhotoCaption(id, caption) {
+    try {
+      const saved = await Store.upsert('photos', { id, caption: caption.trim() });
+      upsertLocal(S.photos, saved);
+    } catch (e) { toast('Could not save the caption: ' + e.message, { type: 'error' }); }
+  }
+
+  async function deletePhoto(id) {
+    const p = S.photos.find((x) => x.id === id);
+    if (!p || !confirm('Delete this photo? This can\'t be undone.')) return;
+    try {
+      await Store.removePhotoFile(p.path);
+      await Store.remove('photos', id);
+      S.photos = S.photos.filter((x) => x.id !== id);
+      refreshPhotos();
+      toast('Photo deleted');
+    } catch (e) { toast('Could not delete the photo: ' + e.message, { type: 'error' }); }
+  }
+
+  async function fetchBlob(url) { const r = await fetch(url); if (!r.ok) throw new Error('The photo could not be downloaded.'); return r.blob(); }
+  function saveBlob(blob, name) {
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = u; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 4000);
+  }
+  async function downloadPhoto(id) {
+    const list = photosFor(E.doc.id);
+    const i = list.findIndex((p) => p.id === id);
+    try { saveBlob(await fetchBlob(list[i].url), `${fileName(E.doc)} photo ${i + 1}.jpg`); }
+    catch (e) { toast(e.message, { type: 'error' }); }
+  }
+  async function downloadAllPhotos() {
+    const list = photosFor(E.doc.id);
+    if (!list.length) return;
+    toast(`Preparing ${plural(list.length, 'photo')}`, { ms: 2000 });
+    try {
+      if (!window.JSZip) {
+        for (let i = 0; i < list.length; i++) saveBlob(await fetchBlob(list[i].url), `${fileName(E.doc)} photo ${i + 1}.jpg`);
+        return;
+      }
+      const zip = new window.JSZip();
+      for (let i = 0; i < list.length; i++) {
+        const cap = (list[i].caption || '').replace(/[\\/:*?"<>|]+/g, '').slice(0, 40).trim();
+        zip.file(`${String(i + 1).padStart(2, '0')}${cap ? ' ' + cap : ''}.jpg`, await fetchBlob(list[i].url));
+      }
+      saveBlob(await zip.generateAsync({ type: 'blob' }), `${fileName(E.doc)} photos.zip`);
+    } catch (e) { toast('Could not download the photos: ' + e.message, { type: 'error' }); }
   }
 
   // ---------------- Customers ----------------
@@ -1211,7 +1702,7 @@
     const c = existing ? { ...existing } : {
       name: '', email: '', phone: '', address: '', website: '', license_no: '', tax_id: '', logo: '', color: '#1F4E46',
       invoice_prefix: 'INV-', estimate_prefix: 'EST-', next_invoice_no: 1, next_estimate_no: 1, tax_rate: 0,
-      payment_terms_days: 30, estimate_valid_days: 30, default_notes: '', default_terms: '', payment_instructions: ''
+      payment_terms_days: 30, estimate_valid_days: 30, default_notes: '', default_terms: '', payment_instructions: '', use_schedule: false, default_schedule: []
     };
     const f = (name, label, type = 'text', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(c[name] ?? '')}" ${extra}></label>`;
     const ta = (name, label, hint = '') => `<label>${label}${hint ? `<span class="hint">${hint}</span>` : ''}<textarea name="${name}" rows="3">${esc(c[name] ?? '')}</textarea></label>`;
@@ -1251,9 +1742,19 @@
           ${ta('default_terms', 'Terms')}
           ${ta('payment_instructions', 'How to pay', 'Shown on invoices, for example your Zelle email or check mailing address.')}
         </section>
+        <section>
+          <h2>Deposits and payment schedule</h2>
+          <p class="sub">Split each job into payments at milestones. Each payment is a percentage of the whole job, of labor and services only, or of materials only. That lets you, for example, collect materials before ordering and split the labor 50 / 25 / 25.</p>
+          <label class="check"><input type="checkbox" id="useSched" ${c.use_schedule ? 'checked' : ''}> Require a deposit: add this schedule to every new estimate</label>
+          <div class="presets"><span class="sub">Quick start:</span>${Object.entries(PRESETS).map(([k, p]) => `<button type="button" class="btn subtle" data-preset="${k}">${p.label}</button>`).join('')}</div>
+          <div class="tbl-wrap"><table class="tbl sched-tbl"><thead><tr><th>Milestone</th><th>Applies to</th><th class="n">%</th><th><span class="vh">Remove</span></th></tr></thead><tbody id="coSched"></tbody></table></div>
+          <div class="sched-foot"><button type="button" class="btn subtle" id="coSchedAdd">Add milestone</button><span class="sched-warn" id="coSchedWarn"></span></div>
+          <p class="sub">You can still change the schedule on any estimate. When a milestone is reached, open the estimate and click <b>Create invoice</b> next to that payment.</p>
+        </section>
       </form>`;
 
     let logo = c.logo || '';
+    const getSched = companySchedule(c);
     const drawLogo = () => {
       $('#logoBox').innerHTML = logo ? `<img src="${logo}" alt="Company logo">` : '<span class="sub">No logo</span>';
       $('#logoRm').hidden = !logo;
@@ -1276,6 +1777,13 @@
       obj.next_estimate_no = Math.max(1, obj.next_estimate_no);
       obj.tax_rate = parseFloat(obj.tax_rate) || 0;
       obj.logo = logo;
+      if (!S.needsUpgrade) {
+        obj.use_schedule = $('#useSched').checked;
+        obj.default_schedule = getSched();
+        const w = D.scheduleCheck({ schedule: obj.default_schedule, items: [] }, true);
+        if (obj.use_schedule && !obj.default_schedule.length) { toast('Add at least one milestone, or untick "Require a deposit".', { type: 'error' }); return; }
+        if (w && !confirm(w + ' Save anyway?')) return;
+      }
       if (existing) obj.id = existing.id;
       try {
         const saved = await Store.upsert('companies', obj);

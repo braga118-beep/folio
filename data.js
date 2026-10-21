@@ -10,8 +10,16 @@
   const Local = {
     key: 'folio:db',
     read() { try { return JSON.parse(localStorage.getItem(this.key)); } catch (e) { return null; } },
-    db() { let d = this.read(); if (!d) { d = seed(); this.save(d); } return d; },
-    save(d) { localStorage.setItem(this.key, JSON.stringify(d)); },
+    db() {
+      let d = this.read();
+      if (!d) { d = seed(); this.save(d); }
+      ['companies', 'customers', 'documents', 'payments', 'events', 'items', 'photos'].forEach((k) => { if (!d[k]) d[k] = []; });
+      return d;
+    },
+    save(d) {
+      try { localStorage.setItem(this.key, JSON.stringify(d)); }
+      catch (e) { throw new Error('Demo storage in this browser is full. Delete some photos, or connect your database to store more.'); }
+    },
     reset() { localStorage.removeItem(this.key); },
     async init() { this.db(); return { mode: 'demo', user: { email: 'Demo mode' } }; },
     async list(t) { return clone(this.db()[t] || []); },
@@ -41,10 +49,13 @@
         d.documents = d.documents.filter((x) => !gone.has(x.id));
         d.payments = d.payments.filter((p) => !gone.has(p.document_id));
         d.events = d.events.filter((e) => !gone.has(e.document_id));
+        d.photos = d.photos.filter((p) => !gone.has(p.document_id));
+        d.items = d.items.filter((it) => it.company_id !== id);
       }
       if (t === 'documents') {
         d.payments = d.payments.filter((p) => p.document_id !== id);
         d.events = d.events.filter((e) => e.document_id !== id);
+        d.photos = d.photos.filter((p) => p.document_id !== id);
       }
       if (t === 'customers') d.documents.forEach((x) => { if (x.customer_id === id) x.customer_id = null; });
       this.save(d);
@@ -62,7 +73,9 @@
         this.save(d);
       }
       const company = d.companies.find((c) => c.id === doc.company_id) || {};
-      return { document: clone(doc), company: clone(company) };
+      const photos = doc.show_photos === false ? [] : d.photos.filter((p) => p.document_id === doc.id)
+        .sort((a, b) => (a.position || 0) - (b.position || 0)).map((p) => ({ url: p.url, caption: p.caption }));
+      return { document: clone(doc), company: clone(company), photos };
     },
     async accept(tok, name) {
       const d = this.db();
@@ -86,6 +99,12 @@
       this.save(d);
       return { ok: true, demo: true };
     },
+    // Demo mode keeps photos inside the browser as small images.
+    async uploadPhoto(docId, blob) {
+      const url = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
+      return { path: null, url };
+    },
+    async removePhotoFile() {},
     onEvent(cb) { window.addEventListener('storage', (e) => { if (e.key === this.key) cb(); }); },
     async signOut() {}
   };
@@ -120,7 +139,7 @@
     async upsert(t, obj) {
       const o = { ...obj };
       delete o.owner;
-      if (t === 'documents') o.updated_at = new Date().toISOString();
+      if (t === 'documents' || t === 'items') o.updated_at = new Date().toISOString();
       const q = o.id ? this.sb.from(t).update(o).eq('id', o.id) : this.sb.from(t).insert(o);
       const { data, error } = await q.select().single();
       if (error) throw error;
@@ -150,6 +169,17 @@
       if (data && data.error) throw new Error(data.error);
       return data;
     },
+    async uploadPhoto(docId, blob) {
+      const { data } = await this.sb.auth.getSession();
+      if (!data.session) throw new Error('You are signed out. Sign in again.');
+      const path = `${data.session.user.id}/${docId}/${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+      const { error } = await this.sb.storage.from('photos').upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+      if (error) throw new Error(error.message);
+      return { path, url: this.sb.storage.from('photos').getPublicUrl(path).data.publicUrl };
+    },
+    async removePhotoFile(path) {
+      if (path) await this.sb.storage.from('photos').remove([path]);
+    },
     onEvent(cb) {
       this.sb.channel('folio-events')
         .on('postgres_changes', { event: '*', schema: 'public', table: 'events' }, () => cb())
@@ -172,7 +202,13 @@
       tax_rate: 5.5, payment_terms_days: 30, estimate_valid_days: 30,
       default_notes: 'All work performed to local code. Daily cleanup and final debris removal included.',
       default_terms: '50% deposit due on acceptance, balance due on completion. Workmanship guaranteed for one year.',
-      payment_instructions: 'Check payable to Northline Builders, or Zelle to office@northlinebuilders.com.'
+      payment_instructions: 'Check payable to Northline Builders, or Zelle to office@northlinebuilders.com.',
+      use_schedule: true,
+      default_schedule: [
+        { name: 'Deposit, due on start day', percent: 50, basis: 'all' },
+        { name: 'After rough-in', percent: 25, basis: 'all' },
+        { name: 'At completion', percent: 25, basis: 'all' }
+      ]
     };
     const cust = (name, email, phone, address) => ({ id: uid(), created_at: at(100), name, email, phone, address, notes: '' });
     const customers = [
@@ -188,7 +224,8 @@
       const d = {
         id: uid(), public_token: token(), company_id: co.id, customer_id: c.id, customer_name: c.name, customer_email: c.email,
         customer_phone: c.phone, customer_address: c.address, status: 'sent', tax_rate: 5.5, discount_type: 'percent', discount_value: 0,
-        notes: co.default_notes, terms: co.default_terms, amount_paid: 0, view_count: 0, archived: false, job_site: c.address,
+        notes: co.default_notes, terms: co.default_terms, amount_paid: 0, view_count: 0, archived: false, job_site: c.address, show_photos: true,
+        schedule: o.type === 'estimate' ? clone(co.default_schedule) : [],
         created_at: at(o.age), updated_at: at(o.age), sent_at: o.status === 'draft' ? null : at(o.age), viewed_at: null, ...o
       };
       delete d.age;
@@ -215,7 +252,18 @@
       items: [L('Labor', 'Remove existing deck and footings; install new helical piers', 32, 85), L('Material', 'Composite decking, PT framing, hidden fasteners, railing', 1, 9200)] }, alice);
 
     const ev = (doc, kind, daysAgo, seen = true, detail = null) => ({ id: uid(), document_id: doc.id, kind, detail, seen, created_at: at(daysAgo) });
+    const item = (name, kind, unit, price, description = '') => ({ id: uid(), created_at: at(60), updated_at: at(60), company_id: null, name, kind, unit, price, description });
+    const items = [
+      item('Tiled shower niche', 'Service', 'each', 450, 'Frame, waterproof and tile a 12 x 24 in. recessed niche, with a sloped sill and trim edges'),
+      item('Carpenter labor', 'Labor', 'hour', 85),
+      item('Drywall, hang and finish', 'Service', 'sq ft', 3.25, 'Hang, tape and finish to a level 4 finish, ready for paint'),
+      item('Interior painting, walls', 'Service', 'sq ft', 2.5, 'Prime and two finish coats, customer-selected color'),
+      item('Dumpster rental, 20 yard', 'Equipment', 'each', 650, 'Delivery, one week on site, haul-away and disposal fees'),
+      item('Building permit', 'Permit', 'each', 250, 'Permit filing and inspection fees')
+    ];
     return {
+      items,
+      photos: [],
       companies: [co],
       customers,
       documents: [inv1, inv2, inv3, est1, inv4, est2, est3],

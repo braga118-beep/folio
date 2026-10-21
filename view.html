@@ -50,8 +50,13 @@
 
     let doc = data.document;
     const company = data.company || {};
+    const photos = data.photos || [];
     const typeName = doc.type === 'invoice' ? 'Invoice' : 'Estimate';
 
+    function firstPayment() {
+      const s = D.scheduleAmounts(doc);
+      return s.length && s[0].amount > 0 ? ` The first payment, ${D.esc(s[0].name || 'deposit')}, is ${D.money(s[0].amount)}.` : '';
+    }
     function drawAccept() {
       if (doc.type !== 'estimate') { box.hidden = true; return; }
       if (doc.status === 'accepted' || doc.status === 'converted') {
@@ -67,7 +72,7 @@
       }
       box.innerHTML = `
         <h2>Ready to go ahead?</h2>
-        <p class="sub">Type your full name to accept this estimate. ${D.esc(company.name)} is notified right away.</p>
+        <p class="sub">Type your full name to accept this estimate. ${D.esc(company.name)} is notified right away.${firstPayment()}</p>
         <form id="acf" class="acf"><input name="n" required placeholder="Your full name" autocomplete="name" aria-label="Your full name"><button class="btn primary" type="submit">Accept estimate</button></form>`;
       document.getElementById('acf').onsubmit = async (e) => {
         e.preventDefault();
@@ -91,7 +96,7 @@
     function draw() {
       document.title = `${typeName} ${doc.number} from ${company.name || ''}`;
       document.getElementById('pubCo').textContent = company.name || '';
-      paperEl.innerHTML = D.renderPaper(doc, company);
+      paperEl.innerHTML = D.renderPaper(doc, company, photos);
       drawAccept();
     }
     draw();
@@ -100,7 +105,7 @@
     dl.hidden = false;
     dl.onclick = async () => {
       dl.disabled = true; dl.textContent = 'Preparing PDF';
-      try { (await D.toPdf(D.renderPaper(doc, company))).save(`${typeName} ${doc.number}.pdf`); }
+      try { (await D.toPdf(doc, company, photos)).save(`${typeName} ${doc.number}.pdf`); }
       catch (e) { alert(e.message); }
       dl.disabled = false; dl.textContent = 'Download PDF';
     };

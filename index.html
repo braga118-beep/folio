@@ -24,6 +24,7 @@
         <a href="#/estimates" data-nav="estimates">Estimates</a>
         <a href="#/invoices" data-nav="invoices">Invoices</a>
         <a href="#/customers" data-nav="customers">Customers</a>
+        <a href="#/pricebook" data-nav="pricebook">Price book</a>
         <a href="#/companies" data-nav="companies">Companies</a>
         <a href="#/settings" data-nav="settings">Settings</a>
       </nav>
@@ -38,15 +39,18 @@
           <span class="badge" hidden></span>
         </button>
       </header>
+      <div id="banner" class="banner" hidden></div>
       <main id="view" class="sheet"></main>
     </div>
   </div>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
+  <datalist id="unitList"><option value="each"><option value="hour"><option value="day"><option value="sq ft"><option value="linear ft"><option value="sq yd"><option value="cu yd"><option value="lot"><option value="job"></datalist>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="config.js"></script>
   <script src="render.js"></script>
   <script src="data.js"></script>
