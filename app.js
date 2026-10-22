@@ -1824,6 +1824,84 @@
     }
   }
 
+  // ---------------- Backup ----------------
+  function toCSV(rows) {
+    const cols = [];
+    rows.forEach((r) => Object.keys(r).forEach((k) => { if (k !== 'logo' && !cols.includes(k)) cols.push(k); }));
+    const cell = (v) => {
+      if (v === null || v === undefined) return '';
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    return '\uFEFF' + [cols.join(','), ...rows.map((r) => cols.map((c) => cell(r[c])).join(','))].join('\r\n');
+  }
+  const safeName = (s) => String(s || '').replace(/[\\/:*?"<>|]+/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
+
+  async function fullBackup(btn) {
+    const status = (t) => { const el = $('#backupStatus'); if (el) el.textContent = t; };
+    if (!window.JSZip) { toast('The zip library did not load. Check your internet connection and refresh.', { type: 'error' }); return; }
+    btn.disabled = true;
+    try {
+      status('Collecting your data');
+      await loadAll();
+      const zip = new window.JSZip();
+      const stamp = today();
+      const tables = { companies: S.companies, customers: S.customers, documents: S.documents, payments: S.payments, events: S.events, items: S.items, photos: S.photos };
+      Object.entries(tables).forEach(([name, rows]) => {
+        zip.file(`data/${name}.json`, JSON.stringify(rows, null, 2));
+        zip.file(`data/${name}.csv`, toCSV(rows));
+      });
+
+      for (const c of S.companies) {
+        if (!c.logo) continue;
+        try { const blob = await (await fetch(c.logo)).blob(); zip.file(`logos/${safeName(c.name) || c.id}.${/svg/.test(blob.type) ? 'svg' : 'png'}`, blob); } catch (e) { /* skip */ }
+      }
+
+      const failed = [];
+      const ph = S.photos.slice();
+      for (let i = 0; i < ph.length; i++) {
+        status(`Downloading photo ${i + 1} of ${ph.length}`);
+        const d = docById(ph[i].document_id);
+        const folder = d ? safeName(`${d.number} ${d.customer_name || ''}`) : 'Unlinked';
+        const n = String((ph[i].position || 0) + 1).padStart(2, '0');
+        try { zip.file(`photos/${folder}/${n}${ph[i].caption ? ' ' + safeName(ph[i].caption) : ''} ${ph[i].id.slice(0, 6)}.jpg`, await fetchBlob(ph[i].url)); }
+        catch (e) { failed.push(ph[i].url); }
+      }
+
+      status('Copying the website files');
+      const site = ['index.html', 'view.html', 'app.js', 'render.js', 'data.js', 'styles.css', 'config.js'];
+      for (const f of site) {
+        try { const r = await fetch(f, { cache: 'no-store' }); if (r.ok) zip.file(`site/${f}`, await r.text()); } catch (e) { /* skip */ }
+      }
+
+      const counts = Object.entries(tables).map(([k, v]) => `  ${k}: ${v.length}`).join('\n');
+      zip.file('README.txt', `Folio backup, ${stamp}
+Account: ${S.mode === 'demo' ? 'demo mode (this browser)' : (S.user && S.user.email) || ''}
+
+What's inside
+- data/   Every table as .csv (opens in Excel or Google Sheets) and .json (complete, for restoring).
+${counts}
+- photos/ Project photos, one folder per estimate or invoice.
+- logos/  Company logos.
+- site/   The website files as they were live on this date (config.js included).
+${failed.length ? `\n${failed.length} photo(s) could not be downloaded:\n${failed.join('\n')}\n` : ''}
+To put the website back: upload the files in site/ to your GitHub repository.
+The database structure is in supabase/schema.sql and supabase/upgrade-1.sql from the original Folio download.
+`);
+
+      status('Creating the zip file');
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+      saveBlob(blob, `Folio backup ${stamp}.zip`);
+      status(`Backup downloaded: ${plural(S.documents.length, 'document')}, ${plural(S.photos.length, 'photo')}${failed.length ? `, ${failed.length} photo(s) skipped` : ''}.`);
+      toast('Backup downloaded');
+    } catch (e) {
+      console.error(e);
+      status('');
+      toast('The backup could not be created: ' + e.message, { type: 'error', ms: 9000 });
+    }
+    btn.disabled = false;
+  }
+
   // ---------------- Settings ----------------
   function vSettings(v) {
     const perm = 'Notification' in window ? Notification.permission : 'unsupported';
@@ -1846,7 +1924,14 @@
         <h2>Notifications</h2>
         <p class="sub">Folio shows a notification when a customer opens or accepts an estimate or invoice, as long as Folio is open in a browser tab. Desktop notifications also appear when the tab is in the background.</p>
         ${notif}
+      </section>
+      <section class="set">
+        <h2>Backup</h2>
+        <p class="sub">Download everything in one zip file: all companies, customers, estimates, invoices, payments, price book and activity (as spreadsheet-friendly CSV files and as JSON), every project photo sorted into a folder per document, your logos, and a copy of the website files. Keep it somewhere safe, like an external drive or cloud storage. Once a month is a good habit.</p>
+        <button class="btn primary" id="backupBtn">Download full backup</button>
+        <p class="sub" id="backupStatus" aria-live="polite"></p>
       </section>`;
+    $('#backupBtn').onclick = (e) => fullBackup(e.currentTarget);
     const ask = $('#askNotif');
     if (ask) ask.onclick = async () => { await Notification.requestPermission(); vSettings(v); };
     const reset = $('#resetDemo');
