@@ -139,6 +139,16 @@
     if (firstBtn) firstBtn.focus();
   }
 
+  // ---------------- Installable app ----------------
+  let installEvt = null;
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvt = e; });
+  window.addEventListener('appinstalled', () => { installEvt = null; toast('Folio is installed. Open it from your home screen.'); });
+  const isInstalled = () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  }
+
   // ---------------- Boot ----------------
   async function boot() {
     try {
@@ -188,6 +198,13 @@
       openMenu(e.currentTarget, [{ label: 'New estimate', run: () => go('#/new/estimate') }, { label: 'New change order', run: () => pickEstimateForCO() }, { label: 'New invoice', run: () => go('#/new/invoice') }]);
     };
     $('#bell').onclick = (e) => { e.stopPropagation(); openBell(e.currentTarget); };
+    $('#moreTab').onclick = (e) => {
+      e.stopPropagation();
+      if (menuEl) { closeMenus(); return; }
+      openMenu(e.currentTarget, [
+        { label: 'Change orders', run: () => go('#/change_orders') }, { label: 'Customers', run: () => go('#/customers') },
+        { label: 'Price book', run: () => go('#/pricebook') }, { label: 'Companies', run: () => go('#/companies') }, { label: 'Settings', run: () => go('#/settings') }]);
+    };
     document.addEventListener('click', (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenus(); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenus(); });
     window.addEventListener('hashchange', route);
@@ -327,7 +344,8 @@
     if (p === 'new') nav = (LIST_LABEL[a] ? a : 'estimate') + 's';
     if (p === 'company') nav = 'companies';
     if (p === 'job') nav = 'jobs';
-    $$('.nav a').forEach((x) => x.classList.toggle('on', x.dataset.nav === nav));
+    $$('[data-nav]').forEach((x) => x.classList.toggle('on', x.dataset.nav === nav));
+    $('#moreTab').classList.toggle('on', ['change_orders', 'customers', 'pricebook', 'companies', 'settings'].includes(nav));
     window.scrollTo(0, 0);
     switch (p) {
       case 'dashboard': return vDashboard(v);
@@ -412,12 +430,14 @@
 
   function vList(v, type) {
     const inv = type === 'invoice';
-    const st = S.list[type] || (S.list[type] = { preset: 'all', from: '', to: '', customer: '', status: '', q: '' });
+    const st = S.list[type] || (S.list[type] = { preset: 'all', from: '', to: '', customer: '', status: '', q: '', view: localStorage.getItem('folio:view:' + type) || 'list' });
+    const canBoard = type !== 'invoice';
+    if (!canBoard) st.view = 'list';
     const statuses = inv ? ['draft', 'sent', 'viewed', 'partial', 'overdue', 'paid'] : ['draft', 'sent', 'viewed', 'accepted', 'converted', 'expired', 'declined'];
     const noun = type === 'change_order' ? 'change order' : type;
     const names = [...new Set(S.documents.filter((d) => d.type === type && inScope(d)).map((d) => d.customer_name).filter(Boolean))].sort();
     v.innerHTML = `
-      <div class="head"><h1>${LIST_LABEL[type]}</h1>${type === 'change_order' ? '<button class="btn primary" id="newCO">New change order</button>' : `<a class="btn primary" href="#/new/${type}">New ${type}</a>`}</div>
+      <div class="head"><h1>${LIST_LABEL[type]}</h1><div class="head-actions">${canBoard ? `<div class="seg" role="group" aria-label="View"><button data-view="list" class="${st.view === 'list' ? 'on' : ''}" aria-pressed="${st.view === 'list'}">List</button><button data-view="board" class="${st.view === 'board' ? 'on' : ''}" aria-pressed="${st.view === 'board'}">Pipeline</button></div>` : ''}${type === 'change_order' ? '<button class="btn primary" id="newCO">New change order</button>' : `<a class="btn primary" href="#/new/${type}">New ${type}</a>`}</div></div>
       <div class="filters">
         <input type="search" id="fq" placeholder="Search by customer, number or job" value="${esc(st.q)}" aria-label="Search">
         <select id="fpreset" aria-label="Date range">${[['all', 'All dates'], ['month', 'This month'], ['30', 'Last 30 days'], ['year', 'This year'], ['lastyear', 'Last year'], ['custom', 'Custom range']]
@@ -426,7 +446,7 @@
         <select id="fcust" aria-label="Customer"><option value="">All customers</option>${names.map((n) => `<option value="${esc(n)}" ${st.customer === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
         <select id="fstatus" aria-label="Status"><option value="">All statuses</option>${statuses.map((s) => `<option value="${s}" ${st.status === s ? 'selected' : ''}>${STATUS_LABEL[s]}</option>`).join('')}<option value="archived" ${st.status === 'archived' ? 'selected' : ''}>Archived</option></select>
       </div>
-      <div class="tbl-wrap"><table class="tbl" id="tbl"></table></div>`;
+      <div id="listArea"></div>`;
 
     const draw = () => {
       let rows = S.documents.filter((d) => d.type === type && inScope(d));
@@ -438,6 +458,8 @@
       if (st.q) { const q = st.q.toLowerCase(); rows = rows.filter((d) => [d.number, d.customer_name, d.job_title].join(' ').toLowerCase().includes(q)); }
       rows.sort((a, b) => (b.issue_date || '').localeCompare(a.issue_date || '') || (b.number || '').localeCompare(a.number || ''));
       const any = S.documents.some((d) => d.type === type && inScope(d));
+      if (st.view === 'board') { $('#listArea').innerHTML = boardHTML(rows, type); return; }
+      $('#listArea').innerHTML = '<div class="tbl-wrap"><table class="tbl" id="tbl"></table></div>';
       const cols = inv ? 8 : 7;
       const sumT = rows.reduce((s, d) => s + totals(d).total, 0);
       const sumB = rows.reduce((s, d) => s + Math.max(totals(d).balance, 0), 0);
@@ -469,14 +491,122 @@
     $('#fto').onchange = (e) => { st.to = e.target.value; draw(); };
     $('#fcust').onchange = (e) => { st.customer = e.target.value; draw(); };
     $('#fstatus').onchange = (e) => { st.status = e.target.value; draw(); };
-    $('#tbl').onclick = (e) => {
+    $$('[data-view]', v).forEach((b) => (b.onclick = () => {
+      st.view = b.dataset.view;
+      localStorage.setItem('folio:view:' + type, st.view);
+      $$('[data-view]', v).forEach((x) => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
+      $('#fstatus').hidden = st.view === 'board';
+      draw();
+    }));
+    $('#fstatus').hidden = st.view === 'board';
+    const area = $('#listArea');
+    area.onclick = (e) => {
       const m = e.target.closest('[data-menu]');
       if (m) { e.stopPropagation(); openMenu(m, docMenu(docById(m.dataset.menu))); return; }
       if (e.target.closest('a')) return;
-      const tr = e.target.closest('tr[data-id]');
+      const tr = e.target.closest('tr[data-id], .card[data-id]');
       if (tr) go('#/doc/' + tr.dataset.id);
     };
+    bindBoardDrag(area, draw);
     draw();
+  }
+
+  // ---------------- Pipeline board (estimates and change orders) ----------------
+  const FOLLOW_UP_DAYS = 3;
+  const BOARD_COLS = [
+    { key: 'draft', label: 'Draft', hint: 'Not sent yet' },
+    { key: 'sent', label: 'Sent', hint: 'Waiting for the customer to open it' },
+    { key: 'viewed', label: 'Viewed', hint: 'Opened, not decided yet' },
+    { key: 'accepted', label: 'Accepted', hint: 'Ready to invoice', drop: true },
+    { key: 'converted', label: 'Invoiced', hint: 'Work billed', drop: true },
+    { key: 'lost', label: 'Declined', hint: 'Declined or expired', drop: true }
+  ];
+  function boardKey(d) {
+    const st = status(d);
+    if (st === 'declined' || st === 'expired') return 'lost';
+    if (st === 'accepted' && S.documents.some((x) => x.type === 'invoice' && x.source_id === d.id)) return 'converted';
+    return st;
+  }
+  const daysSince = (iso) => (iso ? (Date.now() - Date.parse(iso)) / 86400000 : 0);
+  function lastViewed(d) {
+    const ev = S.events.filter((e) => e.document_id === d.id && e.kind === 'viewed').sort(desc)[0];
+    return (ev && ev.created_at) || d.viewed_at;
+  }
+  function cardTag(d, key) {
+    const sent = d.last_sent_at || d.sent_at;
+    if ((key === 'sent' || key === 'viewed') && daysSince(sent) >= FOLLOW_UP_DAYS) {
+      return `<span class="tag follow">Follow up, sent ${ago(sent)}</span>`;
+    }
+    if (key === 'viewed') return `<span class="tag seen">Opened ${ago(lastViewed(d))}</span>`;
+    if (key === 'sent') return `<span class="tag">Sent ${ago(sent)}</span>`;
+    if (key === 'draft') return `<span class="tag">Created ${ago(d.created_at)}</span>`;
+    if (key === 'accepted' || key === 'converted') return d.accepted_at ? `<span class="tag ok">Accepted ${fmtDate(d.accepted_at)}</span>` : '';
+    return `<span class="tag">${STATUS_LABEL[status(d)]}</span>`;
+  }
+
+  function boardHTML(rows, type) {
+    const noun = type === 'change_order' ? 'change orders' : 'estimates';
+    const groups = Object.fromEntries(BOARD_COLS.map((c) => [c.key, []]));
+    rows.forEach((d) => { const k = boardKey(d); (groups[k] || groups.lost).push(d); });
+    const follow = rows.filter((d) => ['sent', 'viewed'].includes(boardKey(d)) && daysSince(d.last_sent_at || d.sent_at) >= FOLLOW_UP_DAYS).length;
+    return `
+      ${follow ? `<p class="board-note">${plural(follow, type === 'change_order' ? 'change order' : 'estimate')} sent more than ${FOLLOW_UP_DAYS} days ago without a decision. A quick call often closes the deal.</p>` : ''}
+      <div class="board" id="board">${BOARD_COLS.map((c) => {
+        const list = groups[c.key];
+        const sum = list.reduce((s, d) => s + totals(d).total, 0);
+        return `
+        <section class="col" data-col="${c.key}" ${c.drop ? 'data-drop="1"' : ''}>
+          <header class="col-head"><div><b>${c.label}</b><span class="count">${list.length}</span></div><span class="num sub">${money(sum)}</span></header>
+          <div class="col-body">${list.map((d) => `
+            <article class="card ${daysSince(d.last_sent_at || d.sent_at) >= FOLLOW_UP_DAYS && ['sent', 'viewed'].includes(c.key) ? 'is-follow' : ''}" draggable="true" data-id="${d.id}" tabindex="0">
+              <div class="card-top"><span class="docno">${esc(d.number)}</span><button class="dots" data-menu="${d.id}" aria-label="Actions for ${esc(d.number)}">•••</button></div>
+              <b class="card-name">${esc(d.customer_name)}</b>
+              ${d.job_title ? `<div class="sub card-job">${esc(d.job_title)}</div>` : ''}
+              <div class="card-foot"><span class="num">${money(totals(d).total)}</span>${cardTag(d, c.key)}</div>
+            </article>`).join('') || `<p class="col-empty">${c.hint || 'Nothing here'}</p>`}</div>
+        </section>`;
+      }).join('')}</div>
+      <p class="sub board-help">Drag a card to <b>Accepted</b>, <b>Invoiced</b> or <b>Declined</b> to update it, or use the ••• menu on a card. Cards move to Sent and Viewed on their own when you send ${noun} and customers open them.</p>`;
+  }
+
+  function bindBoardDrag(area, redraw) {
+    let dragId = null;
+    area.addEventListener('dragstart', (e) => {
+      const card = e.target.closest('.card[data-id]');
+      if (!card) return;
+      dragId = card.dataset.id;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', dragId);
+      setTimeout(() => card.classList.add('dragging'), 0);
+    });
+    area.addEventListener('dragend', () => { $$('.card.dragging, .col.drop-ok', area).forEach((x) => x.classList.remove('dragging', 'drop-ok')); dragId = null; });
+    area.addEventListener('dragover', (e) => {
+      const col = e.target.closest('.col[data-drop]');
+      if (!col || !dragId) return;
+      e.preventDefault();
+      $$('.col.drop-ok', area).forEach((x) => { if (x !== col) x.classList.remove('drop-ok'); });
+      col.classList.add('drop-ok');
+    });
+    area.addEventListener('dragleave', (e) => { const col = e.target.closest('.col'); if (col && !col.contains(e.relatedTarget)) col.classList.remove('drop-ok'); });
+    area.addEventListener('drop', async (e) => {
+      const col = e.target.closest('.col[data-drop]');
+      if (!col || !dragId) return;
+      e.preventDefault();
+      const d = docById(dragId);
+      const to = col.dataset.col;
+      const from = boardKey(d);
+      col.classList.remove('drop-ok');
+      if (!d || to === from) return;
+      if (to === 'accepted') await setEstimate(d, 'accepted', true);
+      else if (to === 'lost') await setEstimate(d, 'declined', true);
+      else if (to === 'converted') {
+        if (!['accepted', 'converted'].includes(d.status) && !confirm(`${d.number} hasn't been accepted yet. Create the invoice anyway?`)) return;
+        if ((d.schedule || []).length) { go('#/doc/' + d.id); toast('This estimate has a payment schedule. Use Create invoice next to each payment.'); return; }
+        await convert(d);
+        return;
+      }
+      redraw();
+    });
   }
 
   function docMenu(d) {
@@ -578,13 +708,15 @@
     } catch (e) { toast('Could not convert: ' + e.message, { type: 'error' }); }
   }
 
-  async function setEstimate(d, st) {
+  async function setEstimate(d, st, fromBoard) {
     const patch = { id: d.id, status: st };
     if (st === 'accepted') { patch.accepted_at = new Date().toISOString(); patch.accepted_by = d.customer_name; }
-    const saved = await Store.upsert('documents', patch);
-    upsertLocal(S.documents, saved);
-    toast(`Estimate ${d.number} marked as ${st}`);
-    afterDocChange(d.id);
+    try {
+      const saved = await Store.upsert('documents', patch);
+      upsertLocal(S.documents, saved);
+      toast(`${typeName(d)} ${d.number} marked as ${st}`);
+      if (!fromBoard) afterDocChange(d.id);
+    } catch (e) { toast('Could not update: ' + e.message, { type: 'error' }); }
   }
 
   async function archive(d) {
@@ -2216,12 +2348,20 @@ The database structure is in supabase/schema.sql and supabase/upgrade-1.sql from
         ${notif}
       </section>
       <section class="set">
+        <h2>Folio app on your phone and tablet</h2>
+        ${isInstalled() ? '<p class="ok">You are using the installed Folio app on this device.</p>'
+        : installEvt ? '<p class="sub">Install Folio on this device. It gets its own icon, opens full screen like a regular app, and can use your camera for job photos.</p><button class="btn primary" id="installBtn">Install Folio</button>'
+        : isIOS() ? '<p class="sub">To install on iPhone or iPad: open this page in <b>Safari</b>, tap the <b>Share</b> button (the square with an arrow), then <b>Add to Home Screen</b>, then <b>Add</b>.</p>'
+        : '<p class="sub">On an Android phone or tablet: open this page in <b>Chrome</b>, tap the <b>⋮</b> menu, then <b>Install app</b> (or <b>Add to Home screen</b>). On a computer, use the install icon at the right end of Chrome\'s address bar.</p>'}
+      </section>
+      <section class="set">
         <h2>Backup</h2>
         <p class="sub">Download everything in one zip file: all companies, customers, estimates, invoices, payments, price book and activity (as spreadsheet-friendly CSV files and as JSON), every project photo sorted into a folder per document, your logos, and a copy of the website files. Keep it somewhere safe, like an external drive or cloud storage. Once a month is a good habit.</p>
         <button class="btn primary" id="backupBtn">Download full backup</button>
         <p class="sub" id="backupStatus" aria-live="polite"></p>
       </section>`;
     $('#backupBtn').onclick = (e) => fullBackup(e.currentTarget);
+    if ($('#installBtn')) $('#installBtn').onclick = async () => { const e = installEvt; if (!e) return; e.prompt(); await e.userChoice; installEvt = null; vSettings(v); };
     const ask = $('#askNotif');
     if (ask) ask.onclick = async () => { await Notification.requestPermission(); vSettings(v); };
     const reset = $('#resetDemo');
