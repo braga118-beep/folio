@@ -8,13 +8,15 @@
   const TRACKED = ['status', 'amount_paid', 'sent_at', 'last_sent_at', 'viewed_at', 'view_count', 'accepted_at', 'accepted_by', 'converted_id', 'archived'];
 
   const S = {
-    mode: null, user: null, companies: [], customers: [], documents: [], payments: [], events: [], items: [], photos: [], needsUpgrade: false,
+    mode: null, user: null, companies: [], customers: [], documents: [], payments: [], events: [], items: [], photos: [], jobs: [], needsUpgrade: false, needsUpgrade2: false, pendingJob: null, pendingSource: null,
     filter: localStorage.getItem('folio:company') || 'all', known: new Set(), list: {}, started: false, pendingCustomer: null
   };
   // Until upgrade-1.sql is run, leave out the new document fields so saving still works.
   const baseUpsert = Store.upsert.bind(Store);
   Store.upsert = (t, o) => {
     if (S.needsUpgrade && t === 'documents') { o = { ...o }; ['schedule', 'show_photos', 'milestone_index', 'milestone_name'].forEach((k) => delete o[k]); }
+    if (S.needsUpgrade2 && t === 'documents') { o = { ...o }; ['job_id', 'contract'].forEach((k) => delete o[k]); }
+    if (S.needsUpgrade2 && t === 'companies') { o = { ...o }; ['change_order_prefix', 'next_change_order_no'].forEach((k) => delete o[k]); }
     return baseUpsert(t, o);
   };
   let E = null; // editor state: { doc, isNew, dirty, hash, saveCustomer }
@@ -25,7 +27,10 @@
   const go = (h) => { location.hash = h; };
   const company = (id) => S.companies.find((c) => c.id === id);
   const docById = (id) => S.documents.find((d) => d.id === id);
-  const typeName = (d) => (d.type === 'invoice' ? 'Invoice' : 'Estimate');
+  const typeName = (d) => D.typeName(d);
+  const isQuote = (d) => D.isQuote(d);
+  const LIST_LABEL = { estimate: 'Estimates', invoice: 'Invoices', change_order: 'Change orders' };
+  const JOB_STATUS = { estimating: 'Estimating', active: 'Active', on_hold: 'On hold', completed: 'Completed' };
   const pill = (st) => `<span class="pill ${st}">${STATUS_LABEL[st] || esc(st)}</span>`;
   const firstName = (n) => (n || '').trim().split(/\s+/)[0] || 'there';
   const inScope = (d) => S.filter === 'all' || d.company_id === S.filter;
@@ -33,11 +38,11 @@
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const fileName = (d) => `${d.number || typeName(d)} ${d.customer_name || ''}`.trim().replace(/[\\/:*?"<>|]+/g, '');
   function upsertLocal(arr, obj) { const i = arr.findIndex((x) => x.id === obj.id); if (i >= 0) arr[i] = obj; else arr.push(obj); return obj; }
+  const counterKey = (type) => (type === 'invoice' ? 'next_invoice_no' : type === 'change_order' ? 'next_change_order_no' : 'next_estimate_no');
   function predictNumber(co, type) {
     if (!co) return '';
-    const inv = type === 'invoice';
-    const p = inv ? (co.invoice_prefix ?? 'INV-') : (co.estimate_prefix ?? 'EST-');
-    const n = inv ? co.next_invoice_no : co.next_estimate_no;
+    const p = type === 'invoice' ? (co.invoice_prefix ?? 'INV-') : type === 'change_order' ? (co.change_order_prefix ?? 'CO-') : (co.estimate_prefix ?? 'EST-');
+    const n = co[counterKey(type)];
     return p + String(n || 1).padStart(4, '0');
   }
   function ago(iso) {
@@ -60,7 +65,7 @@
     const tn = `${typeName(d).toLowerCase()} ${d.number}`;
     switch (e.kind) {
       case 'viewed': return `${d.customer_name} opened ${tn}`;
-      case 'accepted': return `${e.detail || d.customer_name} accepted ${tn}`;
+      case 'accepted': return `${e.detail || d.customer_name} ${d.type === 'change_order' ? 'approved' : 'accepted'} ${tn}`;
       case 'sent': return `Sent ${tn} to ${e.detail || d.customer_name}`;
       case 'reminder': return `Sent a payment reminder for ${tn}`;
       case 'paid': return `Recorded ${money(e.detail)} payment on ${tn}`;
@@ -151,9 +156,10 @@
     const [companies, customers, documents, payments, events] = await Promise.all(
       ['companies', 'customers', 'documents', 'payments', 'events'].map((t) => Store.list(t)));
     // Price book and photos need the database upgrade; keep working without them if it hasn't been run.
-    const optional = await Promise.all(['items', 'photos'].map((t) => Store.list(t).then((r) => r, () => null)));
-    S.needsUpgrade = optional.some((r) => r === null);
-    Object.assign(S, { companies, customers, documents, payments, events, items: optional[0] || [], photos: optional[1] || [] });
+    const optional = await Promise.all(['items', 'photos', 'jobs'].map((t) => Store.list(t).then((r) => r, () => null)));
+    S.needsUpgrade = optional[0] === null || optional[1] === null;
+    S.needsUpgrade2 = optional[2] === null;
+    Object.assign(S, { companies, customers, documents, payments, events, items: optional[0] || [], photos: optional[1] || [], jobs: optional[2] || [] });
   }
 
   async function startApp() {
@@ -179,7 +185,7 @@
     $('#companySwitch').onchange = (e) => { S.filter = e.target.value; localStorage.setItem('folio:company', S.filter); route(); };
     $('#newBtn').onclick = (e) => {
       e.stopPropagation();
-      openMenu(e.currentTarget, [{ label: 'New estimate', run: () => go('#/new/estimate') }, { label: 'New invoice', run: () => go('#/new/invoice') }]);
+      openMenu(e.currentTarget, [{ label: 'New estimate', run: () => go('#/new/estimate') }, { label: 'New change order', run: () => pickEstimateForCO() }, { label: 'New invoice', run: () => go('#/new/invoice') }]);
     };
     $('#bell').onclick = (e) => { e.stopPropagation(); openBell(e.currentTarget); };
     document.addEventListener('click', (e) => { if (menuEl && !menuEl.contains(e.target)) closeMenus(); });
@@ -202,8 +208,9 @@
       : `<p>${esc(S.user && S.user.email)}</p>`;
     renderBell();
     const bn = $('#banner');
-    bn.hidden = !S.needsUpgrade;
-    bn.innerHTML = 'Folio was updated. Run <b>upgrade-1.sql</b> in Supabase (SQL Editor) to turn on the price book, payment schedules and photos.';
+    const files = [S.needsUpgrade && 'upgrade-1.sql', S.needsUpgrade2 && 'upgrade-2.sql'].filter(Boolean);
+    bn.hidden = !files.length;
+    bn.innerHTML = `Folio was updated. Run ${files.map((f) => `<b>${f}</b>`).join(', then ')} in Supabase (SQL Editor) to turn on ${S.needsUpgrade ? 'the price book, payment schedules, photos, ' : ''}jobs and change orders.`;
   }
 
   function unread() { return S.events.filter((e) => !e.seen && (e.kind === 'viewed' || e.kind === 'accepted') && docById(e.document_id)); }
@@ -317,16 +324,20 @@
     v.className = 'sheet';
     let nav = p;
     if (p === 'doc') { const d = docById(a); nav = d ? d.type + 's' : ''; }
-    if (p === 'new') nav = (a === 'invoice' ? 'invoice' : 'estimate') + 's';
+    if (p === 'new') nav = (LIST_LABEL[a] ? a : 'estimate') + 's';
     if (p === 'company') nav = 'companies';
+    if (p === 'job') nav = 'jobs';
     $$('.nav a').forEach((x) => x.classList.toggle('on', x.dataset.nav === nav));
     window.scrollTo(0, 0);
     switch (p) {
       case 'dashboard': return vDashboard(v);
       case 'estimates': return vList(v, 'estimate');
       case 'invoices': return vList(v, 'invoice');
+      case 'change_orders': return vList(v, 'change_order');
+      case 'jobs': return vJobs(v);
+      case 'job': return vJob(v, a);
       case 'doc': return vEditor(v, docById(a));
-      case 'new': return vEditor(v, null, a === 'invoice' ? 'invoice' : 'estimate');
+      case 'new': return vEditor(v, null, LIST_LABEL[a] ? a : 'estimate');
       case 'customers': return vCustomers(v);
       case 'companies': return vCompanies(v);
       case 'company': return vCompany(v, a);
@@ -403,9 +414,10 @@
     const inv = type === 'invoice';
     const st = S.list[type] || (S.list[type] = { preset: 'all', from: '', to: '', customer: '', status: '', q: '' });
     const statuses = inv ? ['draft', 'sent', 'viewed', 'partial', 'overdue', 'paid'] : ['draft', 'sent', 'viewed', 'accepted', 'converted', 'expired', 'declined'];
+    const noun = type === 'change_order' ? 'change order' : type;
     const names = [...new Set(S.documents.filter((d) => d.type === type && inScope(d)).map((d) => d.customer_name).filter(Boolean))].sort();
     v.innerHTML = `
-      <div class="head"><h1>${inv ? 'Invoices' : 'Estimates'}</h1><a class="btn primary" href="#/new/${type}">New ${type}</a></div>
+      <div class="head"><h1>${LIST_LABEL[type]}</h1>${type === 'change_order' ? '<button class="btn primary" id="newCO">New change order</button>' : `<a class="btn primary" href="#/new/${type}">New ${type}</a>`}</div>
       <div class="filters">
         <input type="search" id="fq" placeholder="Search by customer, number or job" value="${esc(st.q)}" aria-label="Search">
         <select id="fpreset" aria-label="Date range">${[['all', 'All dates'], ['month', 'This month'], ['30', 'Last 30 days'], ['year', 'This year'], ['lastyear', 'Last year'], ['custom', 'Custom range']]
@@ -441,10 +453,11 @@
             <td>${pill(status(d))}</td>
             <td class="n"><button class="dots" data-menu="${d.id}" aria-label="Actions for ${esc(d.number)}">•••</button></td>
           </tr>`;
-        }).join('') || `<tr class="none"><td colspan="${cols}">${any ? `No ${type}s match these filters.` : `No ${type}s yet. <a href="#/new/${type}">Create your first ${type}</a>.`}</td></tr>`}</tbody>
-        ${rows.length ? `<tfoot><tr><td colspan="4">${plural(rows.length, type)}</td><td class="n num">${money(sumT)}</td>${inv ? `<td class="n num">${money(sumB)}</td>` : ''}<td colspan="2"></td></tr></tfoot>` : ''}`;
+        }).join('') || `<tr class="none"><td colspan="${cols}">${any ? `No ${noun}s match these filters.` : type === 'change_order' ? 'No change orders yet. Create one from an accepted estimate or a job.' : `No ${noun}s yet. <a href="#/new/${type}">Create your first ${noun}</a>.`}</td></tr>`}</tbody>
+        ${rows.length ? `<tfoot><tr><td colspan="4">${plural(rows.length, noun)}</td><td class="n num">${money(sumT)}</td>${inv ? `<td class="n num">${money(sumB)}</td>` : ''}<td colspan="2"></td></tr></tfoot>` : ''}`;
     };
 
+    if ($('#newCO')) $('#newCO').onclick = () => pickEstimateForCO();
     $('#fq').oninput = (e) => { st.q = e.target.value; draw(); };
     $('#fpreset').onchange = (e) => {
       st.preset = e.target.value;
@@ -468,7 +481,7 @@
 
   function docMenu(d) {
     const inv = d.type === 'invoice';
-    const open = !inv && !['accepted', 'converted', 'declined'].includes(d.status);
+    const open = isQuote(d) && !['accepted', 'converted', 'declined'].includes(d.status);
     return [
       { label: 'Edit', run: () => go('#/doc/' + d.id) },
       { label: 'Preview', run: () => preview(d) },
@@ -476,7 +489,9 @@
       { label: d.sent_at ? 'Send again' : 'Send', run: () => sendModal(d, 'send') },
       inv && d.sent_at && totals(d).balance > 0 ? { label: 'Send payment reminder', run: () => sendModal(d, 'reminder') } : null,
       inv ? { label: 'Record payment', run: () => paymentModal(d) } : null,
-      !inv && d.status !== 'converted' ? { label: 'Convert to invoice', run: () => convert(d) } : null,
+      !inv && d.status !== 'converted' ? { label: d.type === 'change_order' ? 'Create invoice' : 'Convert to invoice', run: () => convert(d) } : null,
+      d.type === 'estimate' && ['accepted', 'converted'].includes(d.status) && !S.needsUpgrade2 ? { label: 'New change order', run: () => startChangeOrder(d) } : null,
+      d.job_id && jobById(d.job_id) ? { label: 'Open job', run: () => go('#/job/' + d.job_id) } : null,
       open ? { label: 'Mark as accepted', run: () => setEstimate(d, 'accepted') } : null,
       open ? { label: 'Mark as declined', run: () => setEstimate(d, 'declined') } : null,
       { label: 'Copy customer link', run: () => copyLink(d) },
@@ -491,7 +506,7 @@
   // ---------------- Document actions ----------------
   function docFields(d) {
     const o = {};
-    ['company_id', 'customer_id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address', 'job_title', 'job_site',
+    ['company_id', 'job_id', 'customer_id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address', 'job_title', 'job_site',
       'tax_rate', 'discount_type', 'discount_value', 'notes', 'terms', 'total', 'show_photos'].forEach((k) => (o[k] = d[k] ?? null));
     o.show_photos = o.show_photos !== false;
     o.items = clone(d.items || []);
@@ -500,7 +515,7 @@
   async function bumpCounter(d) {
     const co = company(d.company_id);
     if (!co) return;
-    const key = d.type === 'invoice' ? 'next_invoice_no' : 'next_estimate_no';
+    const key = counterKey(d.type);
     const updated = await Store.upsert('companies', { id: co.id, [key]: (Number(co[key]) || 1) + 1 });
     upsertLocal(S.companies, updated);
   }
@@ -541,19 +556,24 @@
     } catch (e) { toast('Could not duplicate: ' + e.message, { type: 'error' }); }
   }
 
+  // Only the lines the customer is paying for, without the option markers.
+  const includedItems = (d) => (d.items || []).filter(D.included).map((it) => { const x = clone(it); delete x.option; delete x.group; delete x.selected; return x; });
+
   async function convert(d) {
     if (d.converted_id && docById(d.converted_id)) return go('#/doc/' + d.converted_id);
     const co = company(d.company_id);
     const inv = {
       ...docFields(d), type: 'invoice', status: 'draft', number: predictNumber(co, 'invoice'), issue_date: today(),
-      due_date: addDays(today(), co.payment_terms_days ?? 30), source_id: d.id, amount_paid: 0, terms: co.default_terms || d.terms || ''
+      due_date: addDays(today(), co.payment_terms_days ?? 30), source_id: d.id, amount_paid: 0, terms: co.default_terms || d.terms || '',
+      items: includedItems(d), schedule: [],
+      notes: d.type === 'change_order' ? `Change order ${d.number}${d.notes ? '\n' + d.notes : ''}` : d.notes
     };
     try {
       const saved = await createDoc(inv);
       const est = await Store.upsert('documents', { id: d.id, status: 'converted', converted_id: saved.id });
       upsertLocal(S.documents, est);
       if (E) E.dirty = false;
-      toast(`Invoice ${saved.number} created from estimate ${d.number}`);
+      toast(`Invoice ${saved.number} created from ${typeName(d).toLowerCase()} ${d.number}`);
       go('#/doc/' + saved.id);
     } catch (e) { toast('Could not convert: ' + e.message, { type: 'error' }); }
   }
@@ -657,6 +677,9 @@
     let msg;
     if (kind === 'reminder') {
       msg = `${hi}\n\nThis is a friendly reminder that invoice ${d.number} for ${money(t.balance)} ${d.due_date && d.due_date < today() ? 'was' : 'is'} due on ${fmtDate(d.due_date)}.\n\nYou can view the invoice online ${linkLine}\n\nThank you,\n${co.name}`;
+    } else if (d.type === 'change_order') {
+      const ch = t.total >= 0 ? `adds ${money(t.total)} to` : `takes ${money(-t.total)} off`;
+      msg = `${hi}\n\nAs discussed, here is change order ${d.number}${d.job_title ? ' for ' + d.job_title.toLowerCase() : ''}. It ${ch} the contract.\n\nYou can review and approve it online ${linkLine}\n\nThank you,\n${co.name}`;
     } else if (d.type === 'estimate') {
       msg = `${hi}\n\nThank you for the opportunity. Your estimate${d.job_title ? ' for ' + d.job_title.toLowerCase() : ''} is ready, with a total of ${money(t.total)}.\n\nYou can review and accept it online ${linkLine}\n\nBest regards,\n${co.name}`;
     } else {
@@ -803,6 +826,22 @@
     const c = S.pendingCustomer && S.customers.find((x) => x.id === S.pendingCustomer);
     S.pendingCustomer = null;
     if (c) Object.assign(d, { customer_id: c.id, customer_name: c.name, customer_email: c.email || '', customer_phone: c.phone || '', customer_address: c.address || '', job_site: c.address || '' });
+    // Started from a job or an estimate: carry the customer, job and project over.
+    const src = S.pendingSource && docById(S.pendingSource);
+    const job = jobById(S.pendingJob || (src && src.job_id));
+    S.pendingSource = null; S.pendingJob = null;
+    const from = src || (job && S.documents.find((x) => x.job_id === job.id));
+    if (from) {
+      ['company_id', 'customer_id', 'customer_name', 'customer_email', 'customer_phone', 'customer_address', 'job_title', 'job_site', 'tax_rate'].forEach((k) => (d[k] = from[k]));
+      const fco = company(from.company_id);
+      if (fco) d.number = predictNumber(fco, type);
+    }
+    if (job) { d.job_id = job.id; d.job_title = d.job_title || job.name; d.job_site = d.job_site || job.address || ''; }
+    if (type === 'change_order') {
+      d.items = [{ kind: 'Labor', description: '', qty: 1, price: 0 }];
+      d.notes = ''; d.schedule = [];
+      if (src) d.source_id = src.id;
+    }
     return d;
   }
 
@@ -854,15 +893,15 @@
     const val = (k) => esc(d[k] ?? '');
     v.innerHTML = `
       <div class="ed-top">
-        <a class="back" href="#/${d.type}s">${inv ? 'Invoices' : 'Estimates'}</a>
-        <div class="ed-title"><h1>${E.isNew ? 'New ' + d.type : `${tn} ${esc(d.number)}`}</h1>${E.isNew ? '' : pill(status(d))}</div>
+        <a class="back" href="${d.job_id && jobById(d.job_id) ? '#/job/' + d.job_id : '#/' + d.type + 's'}">${d.job_id && jobById(d.job_id) ? esc(jobById(d.job_id).name) : LIST_LABEL[d.type]}</a>
+        <div class="ed-title"><h1>${E.isNew ? 'New ' + tn.toLowerCase() : `${tn} ${esc(d.number)}`}</h1>${E.isNew ? '' : pill(status(d))}</div>
         <div class="ed-actions">
           <button class="btn" data-act="preview">Preview</button>
           <button class="btn" data-act="download">Download</button>
           <button class="btn" data-act="send">${d.sent_at ? 'Send again' : 'Send'}</button>
           ${inv ? '<button class="btn" data-act="pay">Record payment</button>'
         : (d.schedule || []).length ? '<button class="btn" data-act="nextms">Invoice next payment</button>'
-        : `<button class="btn" data-act="convert">${d.converted_id ? 'Open invoice' : 'Convert to invoice'}</button>`}
+        : `<button class="btn" data-act="convert">${d.converted_id ? 'Open invoice' : d.type === 'change_order' ? 'Create invoice' : 'Convert to invoice'}</button>`}
           ${E.isNew ? '' : '<button class="btn icon" data-act="more" aria-label="More actions">•••</button>'}
           <button class="btn primary" data-act="save">${E.dirty ? 'Save changes' : 'Save'}</button>
         </div>
@@ -901,16 +940,19 @@
               ${!d.customer_id ? `<label class="check small"><input type="checkbox" id="saveCust" ${E.saveCustomer ? 'checked' : ''}> Save to customers</label>` : ''}
             </div>
             <div class="stack">
-              <div class="p-h"><span>Project</span>${d.customer_address ? '<button type="button" class="link small" data-act="sameaddr">Same as customer address</button>' : ''}</div>
+              <div class="p-h"><span>Project</span>${S.needsUpgrade2 ? '' : `<select class="mini" id="jobPick" aria-label="Job">${jobOptions(d)}</select>`}</div>
               <input class="ghost p-strong" data-f="job_title" placeholder="Job, e.g. Kitchen remodel" value="${val('job_title')}" aria-label="Job title">
               <textarea class="ghost" data-f="job_site" rows="1" placeholder="Job site address" aria-label="Job site address">${val('job_site')}</textarea>
+              ${d.customer_address && d.job_site !== d.customer_address ? '<button type="button" class="link small" data-act="sameaddr">Same as customer address</button>' : ''}
+              ${d.type === 'change_order' ? `<p class="co-ref">${d.contract && d.contract.ref ? `Changes to estimate <b>${esc(d.contract.ref)}</b>` : 'Not linked to an estimate'}</p>` : ''}
             </div>
           </section>
           <table class="p-items edit-items">
             <thead><tr><th>Description</th><th class="p-num">Rate</th><th class="p-num">Qty</th><th class="p-num">Amount</th><th><span class="vh">Remove</span></th></tr></thead>
             <tbody id="itemRows">${itemRows()}</tbody>
           </table>
-          <div class="line-btns"><button type="button" class="btn subtle" data-act="addline">Add line item</button><button type="button" class="btn subtle" data-act="pbpick">Add from price book</button></div>
+          <div class="line-btns"><button type="button" class="btn subtle" data-act="addline">Add line item</button><button type="button" class="btn subtle" data-act="pbpick">Add from price book</button>${d.type === 'estimate' ? '<span class="sub opt-hint">Set a line to <b>Optional add-on</b> or <b>Choice</b> to let your customer pick on their estimate page.</span>' : ''}</div>
+          <p class="sched-warn" id="optWarn"></p>
           <section class="p-bottom">
             <div class="p-notes stack">
               <div class="p-h">Notes</div>
@@ -926,10 +968,10 @@
               <div class="tr"><span class="inl">Tax
                 <input class="ghost xs r" data-f="tax_rate" type="number" step="0.001" min="0" value="${Number(d.tax_rate) || 0}" aria-label="Tax rate percent">%</span><span id="tTax"></span></div>
               ${inv ? '<div class="tr total"><span>Total</span><span id="tTotal"></span></div><div class="tr"><span>Paid</span><span id="tPaid"></span></div>' : ''}
-              <div class="tr due"><span>${inv ? 'Balance due' : 'Estimate total'}</span><span id="tBal"></span></div>
+              <div class="tr due"><span>${inv ? 'Balance due' : d.type === 'change_order' ? 'Change order total' : 'Estimate total'}</span><span id="tBal"></span></div>
             </div>
           </section>
-          ${inv ? '' : `<section class="p-sched edit-sched" id="schedBox">${schedHTML()}</section>`}
+          ${d.type === 'estimate' ? `<section class="p-sched edit-sched" id="schedBox">${schedHTML()}</section>` : ''}
         </form>
         <section class="ph-box" id="photoBox">${photosHTML()}</section>
         </div>
@@ -945,12 +987,13 @@
     return items.map((it, i) => `
       <tr data-i="${i}">
         <td>
-          <div class="li-top"><select class="ghost kind" data-k="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select><button type="button" class="link tiny-link" data-act="pbsave" data-i="${i}">Save to price book</button></div>
+          <div class="li-top"><select class="ghost kind" data-k="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>${E.doc.type === 'estimate' ? `<select class="ghost opt-pick ${it.option ? 'on' : ''}" data-k="option" aria-label="Required or optional">${[['', 'Included'], ['addon', 'Optional add-on'], ['choice', 'Choice']].map(([v, l]) => `<option value="${v}" ${(it.option || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>` : ''}<span class="grow"></span><button type="button" class="link tiny-link" data-act="pbsave" data-i="${i}">Save to price book</button></div>
           <textarea class="desc" data-k="description" rows="2" placeholder="Describe the work or material" aria-label="Description"${it.h ? ` style="height:${Number(it.h)}px"` : ''}>${esc(it.description)}</textarea>
+          ${it.option ? `<div class="li-opt">${it.option === 'choice' ? `<input class="ghost grp" data-k="group" value="${esc(it.group || '')}" placeholder="Choice group, e.g. Countertop" aria-label="Choice group">` : ''}<label class="check small"><input type="checkbox" data-k="selected" ${it.selected ? 'checked' : ''}> ${it.option === 'choice' ? 'Selected by default' : 'Included by default'}</label></div>` : ''}
         </td>
-        <td class="p-num"><input class="ghost r rate" type="number" step="0.01" min="0" data-k="price" value="${it.price ?? ''}" aria-label="Rate"><input class="ghost r unit" data-k="unit" list="unitList" placeholder="unit" value="${esc(it.unit || '')}" aria-label="Unit, for example hour or sq ft"></td>
+        <td class="p-num"><input class="ghost r rate" type="number" step="0.01" ${E.doc.type === 'change_order' ? '' : 'min="0"'} data-k="price" value="${it.price ?? ''}" aria-label="Rate"><input class="ghost r unit" data-k="unit" list="unitList" placeholder="unit" value="${esc(it.unit || '')}" aria-label="Unit, for example hour or sq ft"></td>
         <td class="p-num"><input class="ghost r qty" type="number" step="any" min="0" data-k="qty" value="${it.qty ?? ''}" aria-label="Quantity"></td>
-        <td class="p-num amt" data-amt="${i}"></td>
+        <td class="p-num amt ${D.included(it) ? '' : 'off'}" data-amt="${i}"></td>
         <td class="p-num"><button type="button" class="x" data-act="rmline" data-i="${i}" aria-label="Remove line">×</button></td>
       </tr>`).join('');
   }
@@ -967,8 +1010,14 @@
     set('tBal', money(E.doc.type === 'invoice' ? t.balance : t.total));
     E.doc.items.forEach((it, i) => {
       const el = $(`[data-amt="${i}"]`);
-      if (el) el.textContent = money((Number(it.qty) || 0) * (Number(it.price) || 0));
+      if (el) { el.textContent = money((Number(it.qty) || 0) * (Number(it.price) || 0)); el.classList.toggle('off', !D.included(it)); }
     });
+    const ow = $('#optWarn');
+    if (ow) {
+      const groups = [...new Set(E.doc.items.filter((x) => x.option === 'choice').map((x) => x.group || ''))];
+      const bad = groups.filter((g) => !E.doc.items.some((x) => x.option === 'choice' && (x.group || '') === g && x.selected));
+      ow.textContent = bad.length ? `Pick a default for ${bad.map((g) => '"' + (g || 'Choice') + '"').join(', ')}. Customers can still change it.` : '';
+    }
     if ((E.doc.schedule || []).length) {
       D.scheduleAmounts(E.doc).forEach((m, i) => { const el = $(`[data-samt="${i}"]`); if (el) el.textContent = money(m.amount); });
       const w = $('#schedWarn'); if (w) w.textContent = D.scheduleCheck(E.doc);
@@ -987,6 +1036,13 @@
     if (!el.isConnected) return; // ignore late events from a field that was just redrawn
     if (el.id === 'custPick') { if (ev.type === 'change') pickCustomer(el.value); return; }
     if (el.id === 'saveCust') { E.saveCustomer = el.checked; return; }
+    if (el.id === 'jobPick') {
+      if (ev.type !== 'change') return;
+      const j = jobById(el.value);
+      E.doc.job_id = j ? j.id : null;
+      if (j) { if (!E.doc.job_title) E.doc.job_title = j.name; if (!E.doc.job_site) E.doc.job_site = j.address || ''; }
+      markDirty(); drawEditor(); return;
+    }
     if (el.id === 'phIn' || el.id === 'phCam') { if (ev.type === 'change') { const files = [...el.files]; el.value = ''; uploadPhotos(files); } return; }
     if (el.dataset.pc) { if (ev.type === 'change') savePhotoCaption(el.dataset.pc, el.value); return; }
     const sr = el.closest('tr[data-si]');
@@ -1001,6 +1057,20 @@
       const it = E.doc.items[+tr.dataset.i];
       const k = el.dataset.k;
       it[k] = el.type === 'checkbox' ? el.checked : (k === 'qty' || k === 'price' ? parseFloat(el.value) || 0 : el.value);
+      if (k === 'option' && ev.type === 'change') {
+        if (!it.option) { delete it.group; delete it.selected; }
+        else if (it.option === 'addon') it.selected = false;
+        else {
+          it.group = it.group || lastGroup() || 'Option 1';
+          it.selected = !E.doc.items.some((x) => x !== it && x.option === 'choice' && x.group === it.group && x.selected);
+        }
+        markDirty(); redrawLines(); return;
+      }
+      if (k === 'selected' && it.option === 'choice' && it.selected) {
+        E.doc.items.forEach((x) => { if (x !== it && x.option === 'choice' && (x.group || '') === (it.group || '')) x.selected = false; });
+        markDirty(); redrawLines(); return;
+      }
+      if (k === 'selected') { markDirty(); redrawLines(); return; }
       if (el.tagName === 'TEXTAREA') autosize(el);
       if (el.classList.contains('desc') && ev.type === 'input') showSuggest(el);
     } else if (el.dataset.f) {
@@ -1059,6 +1129,15 @@
         upsertLocal(S.customers, c);
         d.customer_id = c.id;
       }
+      if (!S.needsUpgrade2) {
+        if (!d.job_id || !jobById(d.job_id)) {
+          const j = await Store.upsert('jobs', { company_id: d.company_id, customer_id: d.customer_id || null, name: (d.job_title || '').trim() || `${d.customer_name.trim()} project`,
+            address: d.job_site || d.customer_address || '', status: d.type === 'invoice' ? 'active' : 'estimating', notes: '' });
+          upsertLocal(S.jobs, j);
+          d.job_id = j.id;
+        }
+        if (d.type === 'change_order') d.contract = contractFor(d);
+      }
       d.total = totals(d).total;
       const wasNew = !d.id;
       const saved = await Store.upsert('documents', d);
@@ -1079,6 +1158,7 @@
   async function ensureSaved() { return (E.isNew || E.dirty) ? saveDoc(true) : true; }
 
   const ACTS = {
+    newco: async () => { if (await ensureSaved()) startChangeOrder(docById(E.doc.id)); },
     pbpick: () => pickItemsModal(),
     pbsave: (b) => {
       const it = E.doc.items[+b.dataset.i];
@@ -1153,7 +1233,7 @@
   function railHTML() {
     const d = E.doc;
     if (E.isNew) {
-      return `<div class="rail-box"><h3>Before you send</h3><p class="sub">Add the customer and line items, then save. Saving creates a private link to this ${d.type} that you can email to your customer.</p></div>`;
+      return `<div class="rail-box"><h3>Before you send</h3><p class="sub">Add the customer and line items, then save. Saving creates a private link to this ${typeName(d).toLowerCase()} that you can email to your customer.</p></div>`;
     }
     const t = totals(d), st = status(d), inv = d.type === 'invoice';
     const pays = S.payments.filter((p) => p.document_id === d.id).sort((a, b) => (b.paid_on || '').localeCompare(a.paid_on || ''));
@@ -1165,17 +1245,20 @@
       <div class="rail-box summary">
         <div class="row-sb">${pill(st)}<span class="sub">${views}</span></div>
         <div class="big num">${money(inv ? t.balance : t.total)}</div>
-        <div class="sub">${inv ? (t.total > 0 && t.balance <= 0 ? 'Paid in full' : 'Balance due' + (d.due_date ? ' by ' + fmtDate(d.due_date) : '')) : 'Estimate total'}</div>
+        <div class="sub">${inv ? (t.total > 0 && t.balance <= 0 ? 'Paid in full' : 'Balance due' + (d.due_date ? ' by ' + fmtDate(d.due_date) : '')) : d.type === 'change_order' ? 'Change order total' : 'Estimate total'}</div>
         ${d.viewed_at ? `<p class="sub">First opened ${fmtDate(d.viewed_at)}</p>` : ''}
-        ${d.accepted_at ? `<p class="ok">Accepted${d.accepted_by ? ' by ' + esc(d.accepted_by) : ''} on ${fmtDate(d.accepted_at)}</p>` : ''}
-        ${src ? `<p class="sub">Created from <a href="#/doc/${src.id}">estimate ${esc(src.number)}</a></p>` : ''}
+        ${d.accepted_at ? `<p class="ok">${d.type === 'change_order' ? 'Approved' : 'Accepted'}${d.accepted_by ? ' by ' + esc(d.accepted_by) : ''} on ${fmtDate(d.accepted_at)}</p>` : ''}
+        ${d.job_id && jobById(d.job_id) ? `<p class="sub">Job: <a href="#/job/${d.job_id}">${esc(jobById(d.job_id).name)}</a></p>` : ''}
+        ${src ? `<p class="sub">${d.type === 'change_order' ? 'Changes to' : 'Created from'} <a href="#/doc/${src.id}">${typeName(src).toLowerCase()} ${esc(src.number)}</a></p>` : ''}
         ${conv ? `<p class="sub">Converted to <a href="#/doc/${conv.id}">invoice ${esc(conv.number)}</a></p>` : ''}
         ${inv && d.sent_at && t.balance > 0 ? '<button class="btn wide" data-act="remind">Send payment reminder</button>' : ''}
       </div>
-      ${!inv && (d.schedule || []).length ? scheduleRail(d) : ''}
+      ${d.type === 'estimate' && (d.schedule || []).length ? scheduleRail(d) : ''}
+      ${d.type === 'change_order' ? contractRail(d) : ''}
+      ${d.type === 'estimate' && ['accepted', 'converted'].includes(d.status) && !S.needsUpgrade2 ? '<div class="rail-box"><h3>Extra work?</h3><p class="sub">Add work or credits after the estimate is accepted. The customer approves the change order online.</p><button class="btn wide" data-act="newco">New change order</button></div>' : ''}
       <div class="rail-box">
         <h3>Customer link</h3>
-        <p class="sub">Your customer can view${inv ? '' : ' and accept'} this ${d.type} online. You're notified when they open it.</p>
+        <p class="sub">Your customer can view${inv ? '' : d.type === 'change_order' ? ' and approve' : ' and accept'} this ${typeName(d).toLowerCase()} online. You're notified when they open it.</p>
         <div class="btn-row"><button class="btn" data-act="copylink">Copy link</button><button class="btn" data-act="openlink">Open as customer</button></div>
       </div>
       ${inv ? `<div class="rail-box">
@@ -1415,7 +1498,7 @@
       <h2>Add from price book</h2>
       <input type="search" id="pkQ" placeholder="Search" aria-label="Search the price book">
       <div class="pick-list" id="pkList"></div>
-      <div class="m-actions"><span class="sub grow" id="pkCount">Nothing selected</span><button class="btn" data-close>Cancel</button><button class="btn primary" id="pkGo">Add to ${E.doc.type}</button></div>`, (w, close) => {
+      <div class="m-actions"><span class="sub grow" id="pkCount">Nothing selected</span><button class="btn" data-close>Cancel</button><button class="btn primary" id="pkGo">Add to ${typeName(E.doc).toLowerCase()}</button></div>`, (w, close) => {
       const sel = new Set();
       const draw = () => {
         const q = $('#pkQ', w).value.trim().toLowerCase();
@@ -1614,6 +1697,212 @@
     } catch (e) { toast('Could not download the photos: ' + e.message, { type: 'error' }); }
   }
 
+  // ---------------- Jobs ----------------
+  const jobById = (id) => id && S.jobs.find((j) => j.id === id);
+  const jobDocs = (jobId) => S.documents.filter((d) => d.job_id === jobId && !d.archived);
+  const lastGroup = () => { const g = E.doc.items.filter((x) => x.option === 'choice').map((x) => x.group).filter(Boolean); return g[g.length - 1]; };
+
+  function jobOptions(d) {
+    const mine = S.jobs.filter((j) => j.company_id === d.company_id && (!d.customer_id || !j.customer_id || j.customer_id === d.customer_id))
+      .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+    const cur = jobById(d.job_id);
+    if (cur && !mine.includes(cur)) mine.unshift(cur);
+    return `<option value="">${d.id && !cur ? 'No job' : 'New job'}</option>` + mine.map((j) => `<option value="${j.id}" ${j.id === d.job_id ? 'selected' : ''}>${esc(j.name)}</option>`).join('');
+  }
+
+  // Money picture of a job: contract = accepted estimate(s) + approved change orders.
+  function jobMoney(jobId) {
+    const docs = jobDocs(jobId);
+    const accepted = (d) => ['accepted', 'converted'].includes(d.status);
+    const est = docs.filter((d) => d.type === 'estimate');
+    const base = est.filter(accepted).reduce((s, d) => s + totals(d).total, 0);
+    const quoted = est.filter((d) => !accepted(d) && d.status !== 'declined').reduce((s, d) => s + totals(d).total, 0);
+    const cos = docs.filter((d) => d.type === 'change_order' && accepted(d)).reduce((s, d) => s + totals(d).total, 0);
+    const invs = docs.filter((d) => d.type === 'invoice' && d.status !== 'draft');
+    const invoiced = invs.reduce((s, d) => s + totals(d).total, 0);
+    const paid = docs.filter((d) => d.type === 'invoice').reduce((s, d) => s + totals(d).paid, 0);
+    // Jobs billed without an estimate: the invoices are the contract.
+    const contract = D.round2(base || cos ? base + cos : invoiced);
+    return { base, quoted, cos: D.round2(cos), contract, invoiced: D.round2(invoiced), paid: D.round2(paid), owed: D.round2(invoiced - paid), toInvoice: D.round2(contract - invoiced) };
+  }
+
+  // Snapshot shown on a change order: the original estimate and earlier approved changes.
+  function contractFor(co) {
+    const src = docById(co.source_id) || S.documents.find((d) => d.job_id === co.job_id && d.type === 'estimate' && ['accepted', 'converted'].includes(d.status));
+    const prior = S.documents.filter((d) => d.type === 'change_order' && d.id !== co.id && d.job_id && d.job_id === co.job_id && ['accepted', 'converted'].includes(d.status)
+      && (!co.created_at || String(d.created_at) < String(co.created_at)));
+    return { original: src ? totals(src).total : 0, prior: D.round2(prior.reduce((s, d) => s + totals(d).total, 0)), ref: src ? src.number : '' };
+  }
+  function contractRail(d) {
+    const c = d.contract || contractFor(d);
+    const t = totals(d).total;
+    return `<div class="rail-box"><h3>Contract</h3>
+      <div class="kv"><span>Original${c.ref ? ' (' + esc(c.ref) + ')' : ''}</span><b class="num">${money(c.original)}</b></div>
+      ${c.prior ? `<div class="kv"><span>Previous change orders</span><b class="num">${money(c.prior)}</b></div>` : ''}
+      <div class="kv"><span>This change order</span><b class="num">${money(t)}</b></div>
+      <div class="kv total"><span>New contract total</span><b class="num">${money(D.round2(c.original + c.prior + t))}</b></div>
+      <p class="sub">Updated each time you save.</p></div>`;
+  }
+
+  function startChangeOrder(est) {
+    if (S.needsUpgrade2) { toast('Run upgrade-2.sql in Supabase first to use change orders.', { type: 'error' }); return; }
+    if (E) E.dirty = false;
+    S.pendingSource = est.id;
+    go('#/new/change_order');
+  }
+  function pickEstimateForCO() {
+    if (S.needsUpgrade2) { toast('Run upgrade-2.sql in Supabase first to use change orders.', { type: 'error' }); return; }
+    const list = S.documents.filter((d) => d.type === 'estimate' && !d.archived && inScope(d))
+      .sort((a, b) => (['accepted', 'converted'].includes(b.status) - ['accepted', 'converted'].includes(a.status)) || String(b.issue_date).localeCompare(String(a.issue_date)));
+    if (!list.length) { toast('Create an estimate first. Change orders add to an existing estimate.', { type: 'error' }); return; }
+    modal(`<h2>New change order</h2><p class="sub">Which estimate does this change?</p>
+      <div class="pick-list">${list.map((d) => `<button type="button" class="pick" data-est="${d.id}"><span class="who"><b>${esc(d.number)} ${esc(d.customer_name)}</b><span class="sub">${esc(d.job_title || '')}</span></span>${pill(status(d))}</button>`).join('')}</div>
+      <div class="m-actions"><button class="btn" data-close>Cancel</button></div>`, (w, close) => {
+      $$('[data-est]', w).forEach((b) => (b.onclick = () => { close(); startChangeOrder(docById(b.dataset.est)); }));
+    }, 'pick-modal');
+  }
+
+  function vJobs(v) {
+    if (S.needsUpgrade2) { v.innerHTML = '<div class="head"><h1>Jobs</h1></div><p class="lead">Run <b>upgrade-2.sql</b> in Supabase (SQL Editor) to turn on jobs and change orders.</p>'; return; }
+    const st = S.list.jobs || (S.list.jobs = { status: 'open', q: '' });
+    const loose = S.documents.filter((d) => !d.job_id && !d.archived).length;
+    v.innerHTML = `
+      <div class="head">
+        <div><h1>Jobs</h1><p class="lead">Each job keeps its estimate, change orders, invoices, payments and photos together.</p></div>
+        <div class="head-actions"><a class="btn" href="#/new/estimate">New estimate</a></div>
+      </div>
+      ${loose ? `<div class="note-box"><span>${plural(loose, 'document')} ${loose === 1 ? 'isn\'t' : 'aren\'t'} part of a job yet, from before jobs existed.</span><button class="btn" id="organize">Group them into jobs</button></div>` : ''}
+      <div class="filters">
+        <input type="search" id="jq" placeholder="Search jobs or customers" value="${esc(st.q)}" aria-label="Search jobs">
+        <select id="js" aria-label="Status"><option value="open" ${st.status === 'open' ? 'selected' : ''}>Open jobs</option><option value="" ${!st.status ? 'selected' : ''}>All jobs</option>${Object.entries(JOB_STATUS).map(([k, l]) => `<option value="${k}" ${st.status === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      </div>
+      <div class="tbl-wrap"><table class="tbl" id="jtbl"></table></div>`;
+    const draw = () => {
+      let list = S.jobs.filter((j) => S.filter === 'all' || j.company_id === S.filter);
+      if (st.status === 'open') list = list.filter((j) => j.status !== 'completed');
+      else if (st.status) list = list.filter((j) => j.status === st.status);
+      const custName = (j) => { const c = S.customers.find((x) => x.id === j.customer_id); const d = jobDocs(j.id)[0]; return (c && c.name) || (d && d.customer_name) || ''; };
+      if (st.q) { const q = st.q.toLowerCase(); list = list.filter((j) => (j.name + ' ' + custName(j)).toLowerCase().includes(q)); }
+      list.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+      $('#jtbl').innerHTML = `
+        <thead><tr><th>Job</th><th>Status</th><th class="n">Contract</th><th class="n">Invoiced</th><th class="n">Paid</th><th class="n">Owed now</th></tr></thead>
+        <tbody>${list.map((j) => { const m = jobMoney(j.id); return `
+          <tr data-id="${j.id}">
+            <td><b>${esc(j.name)}</b><div class="sub">${esc(custName(j))}</div></td>
+            <td><span class="pill job-${j.status}">${JOB_STATUS[j.status] || esc(j.status)}</span></td>
+            <td class="n num">${m.contract ? money(m.contract) : m.quoted ? `<span class="sub">${money(m.quoted)} quoted</span>` : '–'}</td>
+            <td class="n num">${m.invoiced ? money(m.invoiced) : '–'}</td>
+            <td class="n num">${m.paid ? money(m.paid) : '–'}</td>
+            <td class="n num">${m.owed > 0 ? money(m.owed) : '–'}</td>
+          </tr>`; }).join('') || `<tr class="none"><td colspan="6">${S.jobs.length ? 'No jobs match.' : 'No jobs yet. A job is created automatically when you save a new estimate or invoice.'}</td></tr>`}</tbody>`;
+    };
+    $('#jq').oninput = (e) => { st.q = e.target.value; draw(); };
+    $('#js').onchange = (e) => { st.status = e.target.value; draw(); };
+    $('#jtbl').onclick = (e) => { const tr = e.target.closest('tr[data-id]'); if (tr) go('#/job/' + tr.dataset.id); };
+    if ($('#organize')) $('#organize').onclick = (e) => organizeJobs(e.currentTarget);
+    draw();
+  }
+
+  // One-time: put documents created before jobs existed into jobs (an estimate and everything made from it).
+  async function organizeJobs(btn) {
+    btn.disabled = true;
+    try {
+      const loose = S.documents.filter((d) => !d.job_id);
+      const root = (d) => { let x = d; const seen = new Set(); while (x.source_id && docById(x.source_id) && !seen.has(x.id)) { seen.add(x.id); x = docById(x.source_id); } return x; };
+      const groups = new Map();
+      loose.forEach((d) => { const r = root(d); if (!groups.has(r.id)) groups.set(r.id, { r, docs: [] }); groups.get(r.id).docs.push(d); });
+      let made = 0;
+      for (const { r, docs } of groups.values()) {
+        const jobId = r.job_id || (await (async () => {
+          const paid = docs.some((d) => d.type === 'invoice') && docs.filter((d) => d.type === 'invoice').every((d) => status(d) === 'paid');
+          const j = await Store.upsert('jobs', { company_id: r.company_id, customer_id: r.customer_id || null, name: r.job_title || `${r.customer_name} project`, address: r.job_site || r.customer_address || '',
+            status: paid ? 'completed' : (r.type === 'invoice' || ['accepted', 'converted'].includes(r.status)) ? 'active' : 'estimating', notes: '' });
+          upsertLocal(S.jobs, j); made++; return j.id;
+        })());
+        for (const d of docs) { const saved = await Store.upsert('documents', { id: d.id, job_id: jobId }); upsertLocal(S.documents, saved); }
+      }
+      toast(`${plural(made, 'job')} created`);
+      route();
+    } catch (e) { toast('Could not group the documents: ' + e.message, { type: 'error' }); btn.disabled = false; }
+  }
+
+  function vJob(v, id) {
+    const j = jobById(id);
+    if (!j) { v.innerHTML = '<p class="empty">This job was deleted or doesn\'t exist. <a href="#/jobs">See all jobs</a></p>'; return; }
+    const docs = jobDocs(j.id).sort((a, b) => String(a.issue_date).localeCompare(String(b.issue_date)) || String(a.created_at).localeCompare(String(b.created_at)));
+    const m = jobMoney(j.id);
+    const cust = S.customers.find((c) => c.id === j.customer_id) || {};
+    const anyDoc = docs[0] || {};
+    const pays = S.payments.filter((p) => docs.some((d) => d.id === p.document_id)).sort((a, b) => String(b.paid_on).localeCompare(String(a.paid_on)));
+    const evs = S.events.filter((e) => docs.some((d) => d.id === e.document_id)).sort(desc).slice(0, 12);
+    const photos = docs.flatMap((d) => photosFor(d.id).map((p) => ({ ...p, doc: d })));
+    const hasEstimate = docs.some((d) => d.type === 'estimate' && ['accepted', 'converted'].includes(d.status));
+    const sec = (title, inner, extra = '') => `<section class="job-sec"><div class="row-sb"><h2>${title}</h2>${extra}</div>${inner}</section>`;
+    v.innerHTML = `
+      <div class="head">
+        <div><a class="back" href="#/jobs">Jobs</a>
+          <input class="job-name" id="jName" value="${esc(j.name)}" aria-label="Job name">
+          <p class="sub">${esc(cust.name || anyDoc.customer_name || '')}${j.address ? ', ' + esc(j.address.split('\n').join(', ')) : ''}</p></div>
+        <div class="head-actions">
+          <select id="jStatus" class="status-sel" aria-label="Job status">${Object.entries(JOB_STATUS).map(([k, l]) => `<option value="${k}" ${j.status === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+          <button class="btn" id="jNew">New for this job</button>
+        </div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="l">Contract</div><div class="v">${money(m.contract)}</div><div class="sub">${m.cos ? `includes ${money(m.cos)} in change orders` : m.quoted ? `${money(m.quoted)} quoted, not accepted yet` : 'from accepted estimates'}</div></div>
+        <div class="metric"><div class="l">Invoiced</div><div class="v">${money(m.invoiced)}</div><div class="sub">${m.toInvoice > 0 ? `${money(m.toInvoice)} left to invoice` : 'fully invoiced'}</div></div>
+        <div class="metric"><div class="l">Paid</div><div class="v">${money(m.paid)}</div><div class="sub">${plural(pays.length, 'payment')}</div></div>
+        <div class="metric ${m.owed > 0 ? 'warn-soft' : ''}"><div class="l">Owed now</div><div class="v">${money(Math.max(m.owed, 0))}</div><div class="sub">on sent invoices</div></div>
+      </div>
+      <div class="job-grid">
+        <div>
+          ${sec('Documents', docs.length ? `<table class="tbl" id="jdocs"><thead><tr><th>Document</th><th>Date</th><th class="n">Amount</th><th>Status</th></tr></thead><tbody>${docs.map((d) => `
+            <tr data-id="${d.id}"><td><b>${typeName(d)} ${esc(d.number)}</b>${d.milestone_name ? `<div class="sub">${esc(d.milestone_name)}</div>` : d.type === 'change_order' && d.notes ? `<div class="sub clamp">${esc(d.notes)}</div>` : ''}</td>
+            <td>${fmtDate(d.issue_date)}</td><td class="n num">${money(d.type === 'invoice' ? totals(d).total : totals(d).total)}</td><td>${pill(status(d))}</td></tr>`).join('')}</tbody></table>` : '<p class="empty">No documents yet.</p>')}
+          ${sec('Photos', photos.length ? `<div class="ph-grid">${photos.map((p) => `<figure><a href="${esc(p.url)}" target="_blank" rel="noopener"><img src="${esc(p.url)}" alt="${esc(p.caption || 'Job photo')}" loading="lazy"></a><figcaption class="sub">${esc(p.caption || '')}${p.caption ? ', ' : ''}${esc(p.doc.number)}</figcaption></figure>`).join('')}</div>` : '<p class="sub">Photos added to this job\'s estimates, change orders and invoices show up here.</p>',
+            photos.length ? '<button class="btn" id="jZip">Download all photos</button>' : '')}
+        </div>
+        <div>
+          ${sec('Notes', `<textarea id="jNotes" class="job-notes" rows="5" placeholder="Private notes: gate code, selections, permit number…">${esc(j.notes || '')}</textarea><p class="sub" id="jSaved"></p>`)}
+          ${sec('Payments', pays.length ? `<ul class="pays">${pays.map((p) => { const d = docById(p.document_id); return `<li><div><b class="num">${money(p.amount)}</b><span class="sub">${fmtDate(p.paid_on)}${p.method ? ', ' + esc(p.method) : ''}, ${esc(d ? d.number : '')}</span></div></li>`; }).join('')}</ul>` : '<p class="sub">No payments yet.</p>')}
+          ${sec('Activity', evs.length ? `<ul class="feed small">${evs.map((e) => `<li class="k-${e.kind}"><a href="#/doc/${e.document_id}">${esc(eventText(e))}</a><span class="sub">${ago(e.created_at)}</span></li>`).join('')}</ul>` : '<p class="sub">Nothing yet.</p>')}
+          <button class="btn danger" id="jDel">Delete job</button>
+        </div>
+      </div>`;
+
+    const save = async (patch) => { const saved = await Store.upsert('jobs', { id: j.id, ...patch }); upsertLocal(S.jobs, saved); Object.assign(j, saved); };
+    $('#jName').onchange = async (e) => { const name = e.target.value.trim(); if (!name) { e.target.value = j.name; return; } await save({ name }); toast('Job renamed'); };
+    $('#jStatus').onchange = async (e) => { await save({ status: e.target.value }); toast(`Job marked ${JOB_STATUS[e.target.value].toLowerCase()}`); };
+    $('#jNotes').onchange = async (e) => { await save({ notes: e.target.value }); $('#jSaved').textContent = 'Notes saved'; };
+    if ($('#jdocs')) $('#jdocs').onclick = (e) => { const tr = e.target.closest('tr[data-id]'); if (tr) go('#/doc/' + tr.dataset.id); };
+    $('#jNew').onclick = (e) => {
+      e.stopPropagation();
+      const est = docs.filter((d) => d.type === 'estimate').pop();
+      const accepted = docs.filter((d) => d.type === 'estimate' && ['accepted', 'converted'].includes(d.status)).pop();
+      openMenu(e.currentTarget, [
+        { label: 'New estimate', run: () => { S.pendingJob = j.id; go('#/new/estimate'); } },
+        hasEstimate || est ? { label: 'New change order', run: () => startChangeOrder(accepted || est) } : null,
+        { label: 'New invoice', run: () => { S.pendingJob = j.id; go('#/new/invoice'); } }
+      ]);
+    };
+    if ($('#jZip')) $('#jZip').onclick = async () => {
+      if (!window.JSZip) { toast('The zip library did not load. Refresh and try again.', { type: 'error' }); return; }
+      toast(`Preparing ${plural(photos.length, 'photo')}`, { ms: 2000 });
+      try {
+        const zip = new window.JSZip();
+        for (let i = 0; i < photos.length; i++) zip.file(`${safeName(photos[i].doc.number)}/${String(i + 1).padStart(2, '0')}${photos[i].caption ? ' ' + safeName(photos[i].caption) : ''}.jpg`, await fetchBlob(photos[i].url));
+        saveBlob(await zip.generateAsync({ type: 'blob' }), `${safeName(j.name)} photos.zip`);
+      } catch (err) { toast('Could not download the photos: ' + err.message, { type: 'error' }); }
+    };
+    $('#jDel').onclick = async () => {
+      if (!confirm(`Delete the job "${j.name}"? Its estimates, change orders and invoices are kept; they just won't be grouped anymore.`)) return;
+      await Store.remove('jobs', j.id);
+      S.jobs = S.jobs.filter((x) => x.id !== j.id);
+      S.documents.forEach((d) => { if (d.job_id === j.id) d.job_id = null; });
+      toast('Job deleted'); go('#/jobs');
+    };
+  }
+
   // ---------------- Customers ----------------
   function vCustomers(v) {
     v.innerHTML = `
@@ -1718,7 +2007,7 @@
     const c = existing ? { ...existing } : {
       name: '', email: '', phone: '', address: '', website: '', license_no: '', tax_id: '', logo: '', color: '#1F4E46',
       invoice_prefix: 'INV-', estimate_prefix: 'EST-', next_invoice_no: 1, next_estimate_no: 1, tax_rate: 0,
-      payment_terms_days: 30, estimate_valid_days: 30, default_notes: '', default_terms: '', payment_instructions: '', use_schedule: false, default_schedule: []
+      payment_terms_days: 30, estimate_valid_days: 30, default_notes: '', default_terms: '', payment_instructions: '', use_schedule: false, default_schedule: [], change_order_prefix: 'CO-', next_change_order_no: 1
     };
     const f = (name, label, type = 'text', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(c[name] ?? '')}" ${extra}></label>`;
     const ta = (name, label, hint = '') => `<label>${label}${hint ? `<span class="hint">${hint}</span>` : ''}<textarea name="${name}" rows="3">${esc(c[name] ?? '')}</textarea></label>`;
@@ -1749,7 +2038,7 @@
         </section>
         <section>
           <h2>Numbering</h2>
-          <div class="grid4">${f('estimate_prefix', 'Estimate prefix')}${f('next_estimate_no', 'Next estimate number', 'number', 'min="1"')}${f('invoice_prefix', 'Invoice prefix')}${f('next_invoice_no', 'Next invoice number', 'number', 'min="1"')}</div>
+          <div class="grid4">${f('estimate_prefix', 'Estimate prefix')}${f('next_estimate_no', 'Next estimate number', 'number', 'min="1"')}${f('invoice_prefix', 'Invoice prefix')}${f('next_invoice_no', 'Next invoice number', 'number', 'min="1"')}${S.needsUpgrade2 ? '' : f('change_order_prefix', 'Change order prefix') + f('next_change_order_no', 'Next change order number', 'number', 'min="1"')}</div>
         </section>
         <section>
           <h2>Defaults for new documents</h2>
@@ -1788,7 +2077,8 @@
       const obj = {};
       for (const [k, val] of fd.entries()) if (k) obj[k] = typeof val === 'string' ? val.trim() : val;
       if (!obj.name) { toast('Enter the company name.', { type: 'error' }); form.elements.name.focus(); return; }
-      ['next_invoice_no', 'next_estimate_no', 'payment_terms_days', 'estimate_valid_days'].forEach((k) => (obj[k] = parseInt(obj[k], 10) || 0));
+      ['next_invoice_no', 'next_estimate_no', 'next_change_order_no', 'payment_terms_days', 'estimate_valid_days'].forEach((k) => { if (k in obj) obj[k] = parseInt(obj[k], 10) || 0; });
+      if ('next_change_order_no' in obj) obj.next_change_order_no = Math.max(1, obj.next_change_order_no);
       obj.next_invoice_no = Math.max(1, obj.next_invoice_no);
       obj.next_estimate_no = Math.max(1, obj.next_estimate_no);
       obj.tax_rate = parseFloat(obj.tax_rate) || 0;
@@ -1846,7 +2136,7 @@
       await loadAll();
       const zip = new window.JSZip();
       const stamp = today();
-      const tables = { companies: S.companies, customers: S.customers, documents: S.documents, payments: S.payments, events: S.events, items: S.items, photos: S.photos };
+      const tables = { companies: S.companies, customers: S.customers, jobs: S.jobs, documents: S.documents, payments: S.payments, events: S.events, items: S.items, photos: S.photos };
       Object.entries(tables).forEach(([name, rows]) => {
         zip.file(`data/${name}.json`, JSON.stringify(rows, null, 2));
         zip.file(`data/${name}.csv`, toCSV(rows));

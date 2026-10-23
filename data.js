@@ -13,7 +13,7 @@
     db() {
       let d = this.read();
       if (!d) { d = seed(); this.save(d); }
-      ['companies', 'customers', 'documents', 'payments', 'events', 'items', 'photos'].forEach((k) => { if (!d[k]) d[k] = []; });
+      ['companies', 'customers', 'documents', 'payments', 'events', 'items', 'photos', 'jobs'].forEach((k) => { if (!d[k]) d[k] = []; });
       return d;
     },
     save(d) {
@@ -58,6 +58,8 @@
         d.photos = d.photos.filter((p) => p.document_id !== id);
       }
       if (t === 'customers') d.documents.forEach((x) => { if (x.customer_id === id) x.customer_id = null; });
+      if (t === 'jobs') d.documents.forEach((x) => { if (x.job_id === id) x.job_id = null; });
+      if (t === 'companies') d.jobs = d.jobs.filter((j) => j.company_id !== id);
       this.save(d);
     },
     async getPublic(tok, record = true) {
@@ -77,11 +79,12 @@
         .sort((a, b) => (a.position || 0) - (b.position || 0)).map((p) => ({ url: p.url, caption: p.caption }));
       return { document: clone(doc), company: clone(company), photos };
     },
-    async accept(tok, name) {
+    async accept(tok, name, selected) {
       const d = this.db();
-      const doc = d.documents.find((x) => x.public_token === tok && x.type === 'estimate' && x.status === 'sent');
+      const doc = d.documents.find((x) => x.public_token === tok && (x.type === 'estimate' || x.type === 'change_order') && x.status === 'sent');
       if (!doc) return false;
       const now = new Date().toISOString();
+      if (Array.isArray(selected)) doc.items = doc.items.map((it, i) => (it.option ? { ...it, selected: selected.includes(i) } : it));
       Object.assign(doc, { status: 'accepted', accepted_at: now, accepted_by: name.slice(0, 120) });
       d.events.push({ id: uid(), document_id: doc.id, kind: 'accepted', detail: doc.accepted_by, seen: false, created_at: now });
       this.save(d);
@@ -154,7 +157,12 @@
       if (error) throw error;
       return data;
     },
-    async accept(tok, name) {
+    async accept(tok, name, selected) {
+      if (Array.isArray(selected)) {
+        const r = await this.sb.rpc('accept_estimate', { p_token: tok, p_name: name, p_selected: selected });
+        if (!r.error) return r.data;
+        // Database not upgraded yet: accept without saving the choices.
+      }
       const { data, error } = await this.sb.rpc('accept_estimate', { p_token: tok, p_name: name });
       if (error) throw error;
       return data;
@@ -203,6 +211,7 @@
       default_notes: 'All work performed to local code. Daily cleanup and final debris removal included.',
       default_terms: '50% deposit due on acceptance, balance due on completion. Workmanship guaranteed for one year.',
       payment_instructions: 'Check payable to Northline Builders, or Zelle to office@northlinebuilders.com.',
+      change_order_prefix: 'CO-', next_change_order_no: 2,
       use_schedule: true,
       default_schedule: [
         { name: 'Deposit, due on start day', percent: 50, basis: 'all' },
@@ -249,7 +258,26 @@
     const est2 = mk({ age: 1, type: 'estimate', number: 'EST-0002', job_title: 'Second-floor build-out', issue_date: day(-1), due_date: day(29), viewed_at: at(0.04), view_count: 1,
       items: [L('Labor', 'Layout, framing and drywall for open office and two meeting rooms', 120, 85), L('Material', 'Framing lumber, drywall, insulation and acoustic batts', 1, 7800), L('Subcontract', 'HVAC branch ducts and diffusers', 1, 6400, false)] }, ab);
     const est3 = mk({ age: 0, type: 'estimate', number: 'EST-0003', job_title: 'Deck replacement', issue_date: t, due_date: day(30), status: 'draft',
-      items: [L('Labor', 'Remove existing deck and footings; install new helical piers', 32, 85), L('Material', 'Composite decking, PT framing, hidden fasteners, railing', 1, 9200)] }, alice);
+      items: [L('Labor', 'Remove existing deck and footings; install new helical piers', 32, 85),
+        { ...L('Material', 'Composite decking, standard color line, with PT framing and hidden fasteners', 1, 9200), option: 'choice', group: 'Decking', selected: true },
+        { ...L('Material', 'Composite decking, premium capped line with 50-year warranty, PT framing and hidden fasteners', 1, 11800), option: 'choice', group: 'Decking', selected: false },
+        { ...L('Service', 'Upgrade to black aluminum cable railing, 36 linear ft', 1, 2400), option: 'addon', selected: false },
+        { ...L('Service', 'Low-voltage post-cap lighting, 8 lights with timer', 1, 950), option: 'addon', selected: false }] }, alice);
+    est3.total = D.totals(est3).total;
+
+    // Jobs group each project's estimate, change orders and invoices.
+    const job = (name, c, status, age) => ({ id: uid(), created_at: at(age), company_id: co.id, customer_id: c.id, name, address: c.address, status, notes: '' });
+    const jobs = [
+      job('Sill plate repair', john, 'completed', 52), job('Kitchen remodel', sophie, 'active', 22), job('Office partition walls', ab, 'completed', 45),
+      job('Primary bathroom remodel', jane, 'active', 9), job('Second-floor build-out', ab, 'estimating', 1), job('Deck replacement', alice, 'estimating', 0)
+    ];
+    [[inv1, 0], [inv2, 1], [inv3, 2], [est1, 3], [inv4, 3], [est2, 4], [est3, 5]].forEach(([d, j]) => (d.job_id = jobs[j].id));
+    inv4.milestone_index = 0; inv4.milestone_name = 'Deposit, due on start day';
+    const co1 = mk({ age: 2, type: 'change_order', number: 'CO-0001', job_title: 'Primary bathroom remodel', issue_date: day(-2), due_date: day(28), schedule: [],
+      notes: 'Requested by the homeowner during demolition.',
+      items: [L('Material', 'Electric radiant floor heating mat, 40 sq ft, with programmable thermostat', 1, 780), L('Labor', 'Install heating mat and thermostat; electrician hookup', 6, 85)] }, jane);
+    co1.job_id = jobs[3].id; co1.source_id = est1.id;
+    co1.contract = { original: est1.total, prior: 0, ref: est1.number };
 
     const ev = (doc, kind, daysAgo, seen = true, detail = null) => ({ id: uid(), document_id: doc.id, kind, detail, seen, created_at: at(daysAgo) });
     const item = (name, kind, unit, price, description = '') => ({ id: uid(), created_at: at(60), updated_at: at(60), company_id: null, name, kind, unit, price, description });
@@ -266,7 +294,8 @@
       photos: [],
       companies: [co],
       customers,
-      documents: [inv1, inv2, inv3, est1, inv4, est2, est3],
+      jobs,
+      documents: [inv1, inv2, inv3, est1, inv4, est2, est3, co1],
       payments: [
         { id: uid(), document_id: inv1.id, amount: inv1.total, paid_on: day(-30), method: 'Check', reference: '1042', note: '', created_at: at(30) },
         { id: uid(), document_id: inv2.id, amount: 4000, paid_on: day(-18), method: 'Zelle', reference: '', note: 'Deposit', created_at: at(18) }
@@ -276,7 +305,7 @@
         ev(inv3, 'sent', 45, true, ab.email),
         ev(inv2, 'sent', 20, true, sophie.email), ev(inv2, 'viewed', 19), ev(inv2, 'paid', 18, true, '4000'),
         ev(est1, 'sent', 9, true, jane.email), ev(est1, 'viewed', 8), ev(est1, 'accepted', 5, true, 'Jane Doe'),
-        ev(est2, 'sent', 1, true, ab.email), ev(est2, 'viewed', 0.04, false)
+        ev(est2, 'sent', 1, true, ab.email), ev(est2, 'viewed', 0.04, false), ev(co1, 'sent', 2, true, jane.email)
       ]
     };
   }

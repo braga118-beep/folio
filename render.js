@@ -20,16 +20,22 @@
     return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   };
 
+  // Optional add-ons and good / better / best choices only count when selected.
+  const included = (it) => !it.option || !!it.selected;
+  const isQuote = (d) => d && (d.type === 'estimate' || d.type === 'change_order');
+  const TYPE_NAME = { estimate: 'Estimate', invoice: 'Invoice', change_order: 'Change order' };
+  const typeName = (d) => TYPE_NAME[d.type] || 'Document';
+
   function totals(doc) {
     let subtotal = 0;
-    (doc.items || []).forEach((it) => {
+    (doc.items || []).filter(included).forEach((it) => {
       const a = round2((Number(it.qty) || 0) * (Number(it.price) || 0));
       subtotal += a;
     });
     subtotal = round2(subtotal);
     const dv = Number(doc.discount_value) || 0;
     let discount = doc.discount_type === 'amount' ? dv : (subtotal * dv) / 100;
-    discount = round2(Math.min(Math.max(discount, 0), subtotal));
+    discount = subtotal > 0 ? round2(Math.min(Math.max(discount, 0), subtotal)) : 0;
     const ratio = subtotal ? (subtotal - discount) / subtotal : 0;
     const tax = round2((subtotal * ratio * (Number(doc.tax_rate) || 0)) / 100);
     const total = round2(subtotal - discount + tax);
@@ -43,7 +49,7 @@
   function bases(doc) {
     const t = totals(doc);
     let mat = 0;
-    (doc.items || []).forEach((it) => { if (it.kind === 'Material') mat += round2((Number(it.qty) || 0) * (Number(it.price) || 0)); });
+    (doc.items || []).filter(included).forEach((it) => { if (it.kind === 'Material') mat += round2((Number(it.qty) || 0) * (Number(it.price) || 0)); });
     const r = t.subtotal ? t.total / t.subtotal : 0;
     const materials = round2(mat * r);
     return { all: t.total, materials, labor: round2(t.total - materials) };
@@ -110,7 +116,7 @@
 
   // Display status, derived from the stored status plus dates, views and payments.
   function status(doc) {
-    if (doc.type === 'estimate') {
+    if (isQuote(doc)) {
       if (['accepted', 'declined', 'converted'].includes(doc.status)) return doc.status;
       if (doc.status === 'draft') return 'draft';
       if (doc.due_date && doc.due_date < today()) return 'expired';
@@ -144,8 +150,9 @@
     const co = company || {};
     const t = totals(doc);
     const isInv = doc.type === 'invoice';
+    const isCO = doc.type === 'change_order';
     const brand = /^#[0-9a-f]{3,8}$/i.test(co.color || '') ? co.color : '#1F4E46';
-    const label = `${isInv ? 'Invoice' : 'Estimate'} ${doc.number || ''}`.trim();
+    const label = `${typeName(doc)} ${doc.number || ''}`.trim();
 
     const customer = [
       doc.customer_name ? `<div class="p-strong">${esc(doc.customer_name)}</div>` : '',
@@ -168,11 +175,12 @@
           <div class="p-lines">${companyLines(co)}</div>
         </div>
         <div class="p-title">
-          <div class="p-type">${isInv ? 'Invoice' : 'Estimate'}</div>
+          <div class="p-type${isCO ? ' co' : ''}">${typeName(doc)}</div>
           <dl class="p-meta">
             <dt>Number</dt><dd>${esc(doc.number)}</dd>
             <dt>Issued</dt><dd>${fmtDate(doc.issue_date)}</dd>
             ${doc.due_date ? `<dt>${isInv ? 'Due' : 'Valid until'}</dt><dd>${fmtDate(doc.due_date)}</dd>` : ''}
+            ${isCO && doc.contract && doc.contract.ref ? `<dt>For estimate</dt><dd>${esc(doc.contract.ref)}</dd>` : ''}
           </dl>
         </div>
       </header>
@@ -183,9 +191,14 @@
 
     const unitLabel = (u) => (/^(each|ea|job|lot)$/i.test(u) ? esc(u) : 'per ' + esc(u));
     const thead = '<thead><tr><th>Description</th><th class="p-num">Rate</th><th class="p-num">Qty</th><th class="p-num">Amount</th></tr></thead>';
+    const optTag = (it) => {
+      if (!it.option) return '';
+      const what = it.option === 'choice' ? `Option: ${esc(it.group || 'Choice')}` : 'Optional add-on';
+      return `<span class="p-opt ${it.selected ? 'in' : 'out'}">${what}, ${it.selected ? 'included' : 'not included'}</span>`;
+    };
     const rows = (doc.items || []).map((it) => `
-      <tr>
-        <td class="p-desc">${it.kind ? `<div class="p-kind">${esc(it.kind)}</div>` : ''}${nl(it.description)}</td>
+      <tr class="${included(it) ? '' : 'p-off'}">
+        <td class="p-desc"><div class="p-kind">${it.kind ? esc(it.kind) : ''}${optTag(it)}</div>${nl(it.description)}</td>
         <td class="p-num">${money(it.price)}${it.unit ? `<div class="p-unit">${unitLabel(it.unit)}</div>` : ''}</td>
         <td class="p-num">${num(it.qty)}</td>
         <td class="p-num">${money((Number(it.qty) || 0) * (Number(it.price) || 0))}</td>
@@ -198,7 +211,15 @@
       doc.terms ? `<div class="p-h">Terms</div><p>${nl(doc.terms)}</p>` : ''
     ].filter(Boolean);
     const accepted = !isInv && doc.accepted_at ? `
-      <div class="p-stamp">Accepted${doc.accepted_by ? ' by ' + esc(doc.accepted_by) : ''} on ${fmtDate(doc.accepted_at)}</div>` : '';
+      <div class="p-stamp">${isCO ? 'Approved' : 'Accepted'}${doc.accepted_by ? ' by ' + esc(doc.accepted_by) : ''} on ${fmtDate(doc.accepted_at)}</div>` : '';
+    const c = isCO && doc.contract ? doc.contract : null;
+    const contract = c ? `
+      <div class="p-contract">
+        <div class="tr"><span>Original contract${c.ref ? ' (' + esc(c.ref) + ')' : ''}</span><span>${money(c.original)}</span></div>
+        ${Number(c.prior) ? `<div class="tr"><span>Previous change orders</span><span>${money(c.prior)}</span></div>` : ''}
+        <div class="tr"><span>This change order</span><span>${money(t.total)}</span></div>
+        <div class="tr total"><span>New contract total</span><span>${money(round2((Number(c.original) || 0) + (Number(c.prior) || 0) + t.total))}</span></div>
+      </div>` : '';
     const totalsHtml = `
       <div class="p-totals">
         <div class="tr"><span>Subtotal</span><span>${money(t.subtotal)}</span></div>
@@ -206,13 +227,15 @@
         ${t.tax ? `<div class="tr"><span>Tax (${num(doc.tax_rate)}%)</span><span>${money(t.tax)}</span></div>` : ''}
         ${isInv ? `<div class="tr total"><span>Total</span><span>${money(t.total)}</span></div>` : ''}
         ${isInv && t.paid ? `<div class="tr"><span>Paid</span><span>−${money(t.paid)}</span></div>` : ''}
-        <div class="tr due"><span>${isInv ? 'Balance due' : 'Estimate total'}</span><span>${money(isInv ? t.balance : t.total)}</span></div>
+        <div class="tr due"><span>${isInv ? 'Balance due' : isCO ? 'Change order total' : 'Estimate total'}</span><span>${money(isInv ? t.balance : t.total)}</span></div>
+        ${(doc.items || []).some((it) => it.option) ? '<div class="p-optnote">Total includes only the options marked as included.</div>' : ''}
+        ${contract}
         ${accepted}
       </div>`;
     const bottom = `<section class="p-bottom"><div class="p-notes">${notesBlocks.join('')}</div>${totalsHtml}</section>`;
 
     let sched = null;
-    if (!isInv && (doc.schedule || []).length) {
+    if (doc.type === 'estimate' && (doc.schedule || []).length) {
       const list = scheduleAmounts(doc);
       const showBasis = list.some((m) => m.basis !== 'all');
       const hasFixed = list.some((m) => m.mode === 'amount') && list.some((m) => m.mode === 'percent');
@@ -431,5 +454,5 @@
     return out.toDataURL('image/jpeg', 0.9);
   }
 
-  window.Doc = { esc, nl, money, num, round2, today, addDays, fmtDate, totals, status, STATUS_LABEL, companyLines, renderPaper, buildPages, toPdf, toJpeg, BASIS_LABEL, bases, scheduleAmounts, scheduleCheck, shareLabel };
+  window.Doc = { esc, nl, money, num, round2, today, addDays, fmtDate, totals, status, STATUS_LABEL, companyLines, renderPaper, buildPages, toPdf, toJpeg, BASIS_LABEL, bases, scheduleAmounts, scheduleCheck, shareLabel, included, isQuote, typeName, TYPE_NAME };
 })();

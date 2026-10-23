@@ -51,44 +51,98 @@
     let doc = data.document;
     const company = data.company || {};
     const photos = data.photos || [];
-    const typeName = doc.type === 'invoice' ? 'Invoice' : 'Estimate';
+    const typeName = D.typeName(doc);
+    const isCO = doc.type === 'change_order';
+    const noun = isCO ? 'change order' : 'estimate';
+    const optLines = () => (doc.items || []).map((it, i) => ({ it, i })).filter((x) => x.it.option);
+    const canChoose = () => D.isQuote(doc) && doc.status === 'sent' && !(doc.due_date && doc.due_date < D.today());
 
     function firstPayment() {
       const s = D.scheduleAmounts(doc);
       return s.length && s[0].amount > 0 ? ` The first payment, ${D.esc(s[0].name || 'deposit')}, is ${D.money(s[0].amount)}.` : '';
     }
+
+    // Optional add-ons (tick boxes) and good / better / best choices (one per group).
+    function optionsHTML() {
+      const lines = optLines();
+      if (!lines.length || !canChoose()) return '';
+      const amount = (it) => D.money((Number(it.qty) || 0) * (Number(it.price) || 0));
+      const title = (it) => D.esc(String(it.description || '').split('\n')[0] || it.kind || 'Option');
+      const rest = (it) => D.esc(String(it.description || '').split('\n').slice(1).join(' '));
+      const groups = [...new Set(lines.filter((x) => x.it.option === 'choice').map((x) => x.it.group || 'Choice'))];
+      const addons = lines.filter((x) => x.it.option === 'addon');
+      return `
+        <div class="opts">
+          <h2>Choose your options</h2>
+          <p class="sub">Your total updates as you choose.</p>
+          ${groups.map((g) => `
+            <fieldset class="opt-group"><legend>${D.esc(g)}</legend>
+              ${lines.filter((x) => x.it.option === 'choice' && (x.it.group || 'Choice') === g).map(({ it, i }) => `
+                <label class="opt-row"><input type="radio" name="g-${D.esc(g)}" value="${i}" ${it.selected ? 'checked' : ''}>
+                  <span class="opt-text"><b>${title(it)}</b>${rest(it) ? `<span class="sub">${rest(it)}</span>` : ''}</span><span class="num">${amount(it)}</span></label>`).join('')}
+            </fieldset>`).join('')}
+          ${addons.length ? `<fieldset class="opt-group"><legend>Add-ons</legend>
+            ${addons.map(({ it, i }) => `
+              <label class="opt-row"><input type="checkbox" value="${i}" ${it.selected ? 'checked' : ''}>
+                <span class="opt-text"><b>${title(it)}</b>${rest(it) ? `<span class="sub">${rest(it)}</span>` : ''}</span><span class="num">+ ${amount(it)}</span></label>`).join('')}
+          </fieldset>` : ''}
+          <div class="opt-total"><span>Your total</span><b>${D.money(D.totals(doc).total)}</b></div>
+        </div>`;
+    }
+
     function drawAccept() {
-      if (doc.type !== 'estimate') { box.hidden = true; return; }
+      if (!D.isQuote(doc)) { box.hidden = true; return; }
       if (doc.status === 'accepted' || doc.status === 'converted') {
         box.hidden = false;
-        box.innerHTML = `<p class="ok">You accepted this estimate${doc.accepted_by ? ' as ' + D.esc(doc.accepted_by) : ''}${doc.accepted_at ? ' on ' + D.fmtDate(doc.accepted_at) : ''}. ${D.esc(company.name)} has been notified.</p>`;
+        box.innerHTML = `<p class="ok">You ${isCO ? 'approved' : 'accepted'} this ${noun}${doc.accepted_by ? ' as ' + D.esc(doc.accepted_by) : ''}${doc.accepted_at ? ' on ' + D.fmtDate(doc.accepted_at) : ''}. ${D.esc(company.name)} has been notified.</p>`;
         return;
       }
       if (doc.status !== 'sent' && !(preview && doc.status === 'draft')) { box.hidden = true; return; }
       box.hidden = false;
       if (doc.due_date && doc.due_date < D.today()) {
-        box.innerHTML = `<p>This estimate expired on ${D.fmtDate(doc.due_date)}. Contact ${D.esc(company.name)} for an updated estimate.</p>`;
+        box.innerHTML = `<p>This ${noun} expired on ${D.fmtDate(doc.due_date)}. Contact ${D.esc(company.name)} for an updated ${noun}.</p>`;
         return;
       }
       box.innerHTML = `
-        <h2>Ready to go ahead?</h2>
-        <p class="sub">Type your full name to accept this estimate. ${D.esc(company.name)} is notified right away.${firstPayment()}</p>
-        <form id="acf" class="acf"><input name="n" required placeholder="Your full name" autocomplete="name" aria-label="Your full name"><button class="btn primary" type="submit">Accept estimate</button></form>`;
+        ${optionsHTML()}
+        <h2>${isCO ? 'Approve this change order' : 'Ready to go ahead?'}</h2>
+        <p class="sub">Type your full name to ${isCO ? 'approve this change order' : 'accept this estimate'}${optLines().length ? ' with the options you chose' : ''}. ${D.esc(company.name)} is notified right away.${isCO ? '' : firstPayment()}</p>
+        <form id="acf" class="acf"><input name="n" required placeholder="Your full name" autocomplete="name" aria-label="Your full name"><button class="btn primary" type="submit">${isCO ? 'Approve change order' : 'Accept estimate'}</button></form>`;
+
+      box.querySelectorAll('.opts input').forEach((inp) => {
+        inp.onchange = () => {
+          const i = Number(inp.value);
+          if (inp.type === 'radio') {
+            const g = doc.items[i].group || 'Choice';
+            doc.items = doc.items.map((it, k) => (it.option === 'choice' && (it.group || 'Choice') === g ? { ...it, selected: k === i } : it));
+          } else {
+            doc.items = doc.items.map((it, k) => (k === i ? { ...it, selected: inp.checked } : it));
+          }
+          const y = window.scrollY;
+          const name = (document.querySelector('#acf input') || {}).value || '';
+          draw();
+          const f = document.querySelector('#acf input'); if (f) f.value = name;
+          window.scrollTo(0, y);
+        };
+      });
+
       document.getElementById('acf').onsubmit = async (e) => {
         e.preventDefault();
         const name = e.target.n.value.trim();
         if (!name) return;
-        if (preview) { alert('This is a preview, so the estimate was not accepted.'); return; }
+        if (preview) { alert(`This is a preview, so the ${noun} was not ${isCO ? 'approved' : 'accepted'}.`); return; }
         const b = e.target.querySelector('button');
         b.disabled = true;
         try {
-          const ok = await window.Store.accept(tok, name);
+          const selected = optLines().length ? doc.items.map((it, i) => (it.option && it.selected ? i : -1)).filter((i) => i >= 0) : undefined;
+          const ok = await window.Store.accept(tok, name, selected);
           if (ok === false) throw new Error('not accepted');
           doc = { ...doc, status: 'accepted', accepted_by: name, accepted_at: new Date().toISOString() };
           draw();
+          window.scrollTo(0, 0);
         } catch (err) {
           b.disabled = false;
-          alert(`The estimate could not be accepted online. Please contact ${company.name} directly.`);
+          alert(`The ${noun} could not be ${isCO ? 'approved' : 'accepted'} online. Please contact ${company.name} directly.`);
         }
       };
     }
