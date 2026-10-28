@@ -717,3 +717,21 @@ body { overflow-x: clip; }
   .paper:not(.edit) .p-items:not(.sched) .p-mob { display: block; font-size: 12.5px; color: #6B7682; margin-top: 3px; }
 }
 @media (max-width: 820px) { .paper.edit .edit-items td.amt.off { text-decoration: none; color: #A5ADB4; } }
+
+/* ---------- Import from Skynova ---------- */
+.drop { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; border: 1.5px dashed #C3CBCF; border-radius: 14px; padding: 30px 20px; background: var(--desk); cursor: pointer; color: var(--ink); font-weight: 400; margin-bottom: 14px; transition: border-color .12s, background .12s; }
+.drop:hover, .drop.over { border-color: var(--spruce-2); background: #EEF4F2; }
+.drop b { font-size: 15px; color: var(--spruce); }
+.imp-tbl td { vertical-align: top; }
+.imp-tbl tr.off td { opacity: .55; }
+.imp-tbl input[type=checkbox] { accent-color: var(--spruce); width: 17px; height: 17px; margin-top: 3px; }
+.imp-foot { display: flex; flex-direction: column; gap: 12px; margin-top: 18px; max-width: 760px; }
+.imp-foot .btn-row { justify-content: flex-start; }
+.modal.wide-form { width: min(760px, 100%); }
+.modal h3 { margin: 6px 0 -4px; font-size: 15px; }
+.rv-line { border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.rv-top { display: flex; align-items: center; gap: 8px; }
+.rv-top select { width: auto !important; font-size: 13px; padding: 5px 8px; }
+.rv-line textarea { min-height: 60px; }
+.rv-nums { display: flex; gap: 10px; flex-wrap: wrap; }
+.rv-nums label { flex: 1 1 120px; }

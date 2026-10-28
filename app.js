@@ -344,6 +344,7 @@
     if (p === 'new') nav = (LIST_LABEL[a] ? a : 'estimate') + 's';
     if (p === 'company') nav = 'companies';
     if (p === 'job') nav = 'jobs';
+    if (p === 'import') nav = 'settings';
     $$('[data-nav]').forEach((x) => x.classList.toggle('on', x.dataset.nav === nav));
     $('#moreTab').classList.toggle('on', ['change_orders', 'customers', 'pricebook', 'companies', 'settings'].includes(nav));
     window.scrollTo(0, 0);
@@ -361,6 +362,7 @@
       case 'company': return vCompany(v, a);
       case 'settings': return vSettings(v);
       case 'pricebook': return vPriceBook(v);
+      case 'import': return vImport(v);
       default: location.replace('#/dashboard');
     }
   }
@@ -2035,6 +2037,259 @@
     };
   }
 
+  // ---------------- Import from Skynova (PDF) ----------------
+  const IMP = { rows: [], seq: 0 };
+  const normName = (s) => String(s || '').toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, ' ').trim();
+  const EST_STATUS = { sent: 'Sent', accepted: 'Accepted', declined: 'Declined', draft: 'Draft' };
+
+  function vImport(v) {
+    v.innerHTML = `
+      <div class="head"><div><a class="back" href="#/settings">Settings</a><h1>Import from Skynova</h1>
+        <p class="lead">In Skynova, download each estimate or invoice as a PDF (row menu, then <b>Download/Print PDF</b>) and add them here. Folio reads each one and fills in the customer, address, number, dates, every line item with its description, rate and quantity, the notes and the totals. You check everything before anything is saved.</p></div></div>
+      <label class="drop" id="impDrop">
+        <input type="file" id="impIn" accept="application/pdf,.pdf" multiple class="vh">
+        <b>Choose PDF files</b><span class="sub">or drag them here. Add as many as you like, in one batch or several.</span>
+      </label>
+      <p class="sub" id="impStatus" aria-live="polite"></p>
+      <div id="impArea"></div>`;
+    const input = $('#impIn');
+    input.onchange = () => { const f = [...input.files]; input.value = ''; readPdfs(f); };
+    const drop = $('#impDrop');
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+    drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); readPdfs([...e.dataTransfer.files].filter((f) => /pdf$/i.test(f.type) || /\.pdf$/i.test(f.name))); });
+    drawImport();
+  }
+
+  // Line items as they'll be saved: optional extras only exist on estimates.
+  function impItems(d) {
+    return d.items.map((it) => {
+      const x = { ...it };
+      if (d.type === 'estimate') {
+        if (!x.option && Number(x.qty) === 0 && Number(x.price) > 0) { x.option = 'addon'; x.selected = false; x.qty = 1; }
+      } else if (x.option) {
+        if (!x.selected) x.qty = 0;
+        delete x.option; delete x.group; delete x.selected;
+      }
+      return x;
+    });
+  }
+  const impTotal = (d) => totals({ items: impItems(d), tax_rate: d.tax_rate, discount_type: 'amount', discount_value: d.discount }).total;
+
+  function impCheck(r) {
+    const d = r.data;
+    r.dup = S.documents.some((x) => x.type === d.type && String(x.number) === String(d.number) && normName(x.customer_name) === normName(d.customer.name));
+    r.warn = (d.warnings || []).filter((w) => !/^Customer not found$|^Number not found$/.test(w) || (/Customer/.test(w) ? !d.customer.name : !d.number));
+    if (!d.customer.name && !r.warn.includes('Customer not found')) r.warn.push('Customer not found');
+    const t = impTotal(d);
+    if (d.items.length && Math.abs(t - d.total) > 0.05) r.warn.push(`Folio total ${money(t)} differs from the PDF's ${money(d.total)}`);
+    if (r.dup) r.include = false;
+  }
+
+  async function readPdfs(files) {
+    if (!files.length) return;
+    if (!window.FolioImport) { toast('The importer did not load. Refresh the page and try again.', { type: 'error' }); return; }
+    const st = $('#impStatus');
+    for (let i = 0; i < files.length; i++) {
+      if (st) st.textContent = `Reading ${i + 1} of ${files.length}: ${files[i].name}`;
+      const res = await window.FolioImport.parsePdf(files[i]);
+      const row = { id: ++IMP.seq, file: files[i].name, include: !!res.ok, error: res.ok ? '' : res.error, warn: [], data: res.ok ? { ...res, est_status: 'sent' } : null };
+      if (row.data) impCheck(row);
+      IMP.rows.push(row);
+    }
+    if (st) st.textContent = '';
+    drawImport();
+  }
+
+  function drawImport() {
+    const area = $('#impArea');
+    if (!area) return;
+    const rows = IMP.rows;
+    if (!rows.length) { area.innerHTML = ''; return; }
+    const co = (S.filter !== 'all' && company(S.filter)) || S.companies[0];
+    const inc = rows.filter((r) => r.include && r.data);
+    const custCount = new Set(inc.map((r) => normName(r.data.customer.name))).size;
+    area.innerHTML = `
+      <div class="tbl-wrap"><table class="tbl imp-tbl">
+        <thead><tr><th><span class="vh">Include</span></th><th>Document</th><th>Customer</th><th>Date</th><th class="n">Total</th><th>Check</th><th><span class="vh">Review</span></th></tr></thead>
+        <tbody>${rows.map((r) => {
+          if (!r.data) return `<tr><td></td><td><b>${esc(r.file)}</b></td><td colspan="4" class="err">${esc(r.error)}</td><td class="n"><button class="link danger" data-rm="${r.id}">Remove</button></td></tr>`;
+          const d = r.data;
+          const known = S.customers.some((c) => normName(c.name) === normName(d.customer.name));
+          const opts = d.type === 'estimate' ? impItems(d).filter((x) => x.option).length : 0;
+          return `<tr class="${r.include ? '' : 'off'}">
+            <td><input type="checkbox" data-inc="${r.id}" ${r.include ? 'checked' : ''} aria-label="Import ${esc(r.file)}"></td>
+            <td><b>${typeName(d)} ${esc(d.number || '?')}</b>${d.type === 'estimate' ? ` <span class="sub">${EST_STATUS[d.est_status]}</span>` : ''}<div class="sub">${esc(r.file)}</div></td>
+            <td>${esc(d.customer.name || '?')}<div class="sub">${known ? 'Existing customer' : 'New customer'}${d.customer.address ? ', ' + esc(d.customer.address.split('\n')[0]) : ''}</div></td>
+            <td>${fmtDate(d.issue_date)}</td>
+            <td class="n num">${money(impTotal(d))}<div class="sub">${plural(d.items.length, 'line')}${opts ? `, ${opts} optional` : ''}</div></td>
+            <td>${r.dup ? '<span class="pill">Already in Folio</span>' : r.warn.length ? `<span class="pill overdue" title="${esc(r.warn.join('. '))}">Check</span>` : '<span class="pill paid">Ready</span>'}</td>
+            <td class="n"><button class="btn" data-rev="${r.id}">Review</button></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>
+      <div class="imp-foot">
+        ${S.companies.length > 1 ? `<label>Import into<select id="impCo">${S.companies.map((c) => `<option value="${c.id}" ${c.id === co.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>` : ''}
+        <p class="sub">Customers with the same name become one customer, so a customer with several estimates gets all of them. Each document gets its own job; an invoice for the same customer and amount as an imported estimate joins that estimate's job. Imported documents keep their Skynova numbers; new ones you create keep Folio's numbering.</p>
+        <div class="btn-row"><button class="btn" id="impClear">Start over</button><button class="btn primary" id="impGo" ${inc.length ? '' : 'disabled'}>Import ${plural(inc.length, 'document')}${custCount ? ` for ${plural(custCount, 'customer')}` : ''}</button></div>
+      </div>`;
+    area.onclick = (e) => {
+      const rev = e.target.closest('[data-rev]'); if (rev) { reviewImport(IMP.rows.find((r) => r.id === +rev.dataset.rev)); return; }
+      const rm = e.target.closest('[data-rm]'); if (rm) { IMP.rows = IMP.rows.filter((r) => r.id !== +rm.dataset.rm); drawImport(); }
+    };
+    area.onchange = (e) => { const c = e.target.closest('[data-inc]'); if (c) { IMP.rows.find((r) => r.id === +c.dataset.inc).include = c.checked; drawImport(); } };
+    $('#impClear').onclick = () => { IMP.rows = []; drawImport(); };
+    $('#impGo').onclick = (e) => runImport(e.currentTarget);
+  }
+
+  function reviewImport(r) {
+    const d = r.data;
+    const work = clone(d);
+    const lines = () => work.items.map((it, i) => `
+      <div class="rv-line" data-li="${i}">
+        <div class="rv-top"><select data-lk="kind" aria-label="Line type">${KINDS.map((k) => `<option ${k === it.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
+        ${work.type === 'estimate' ? `<select data-lk="option" aria-label="Included or optional"><option value="" ${!it.option ? 'selected' : ''}>Included</option><option value="addon" ${it.option === 'addon' && !it.selected ? 'selected' : ''}>Optional add-on, not included</option><option value="addon-in" ${it.option === 'addon' && it.selected ? 'selected' : ''}>Optional add-on, included</option></select>` : ''}
+        <span class="grow"></span><button type="button" class="x" data-ldel="${i}" aria-label="Remove line">×</button></div>
+        <textarea data-lk="description" rows="${Math.min(12, String(it.description).split('\n').length + 1)}" aria-label="Description">${esc(it.description)}</textarea>
+        <div class="rv-nums">
+          <label>Rate<input data-lk="price" type="number" step="0.01" value="${Number(it.price) || 0}"></label>
+          <label>Qty<input data-lk="qty" type="number" step="any" value="${Number(it.qty) || 0}"></label>
+        </div>
+      </div>`).join('');
+    const isEst = () => work.type === 'estimate';
+    modal(`
+      <h2>Review ${esc(r.file)}</h2>
+      ${r.warn.length ? `<p class="note">${esc(r.warn.join('. '))}.</p>` : ''}
+      <div class="grid3">
+        <label>Type<select id="rvType"><option value="estimate" ${isEst() ? 'selected' : ''}>Estimate</option><option value="invoice" ${!isEst() ? 'selected' : ''}>Invoice</option></select></label>
+        <label>Number<input id="rvNum" value="${esc(d.number)}"></label>
+        <label id="rvStBox"></label>
+        <label>Issued<input id="rvDate" type="date" value="${esc(d.issue_date)}"></label>
+        <label id="rvDueLab">${isEst() ? 'Valid until' : 'Due'}<input id="rvDue" type="date" value="${esc(d.due_date)}"></label>
+        <label>Tax %<input id="rvTax" type="number" step="0.001" value="${Number(d.tax_rate) || 0}"></label>
+      </div>
+      <h3>Customer</h3>
+      <div class="grid2">
+        <label>Name<input id="rvName" value="${esc(d.customer.name)}"></label>
+        <label>Email<input id="rvEmail" type="email" value="${esc(d.customer.email)}"></label>
+        <label>Phone<input id="rvPhone" type="tel" value="${esc(d.customer.phone)}"></label>
+        <label>Address<textarea id="rvAddr" rows="2">${esc(d.customer.address)}</textarea></label>
+      </div>
+      <h3>Line items</h3>
+      <div id="rvLines">${lines()}</div>
+      <label>Notes<textarea id="rvNotes" rows="6">${esc(d.notes)}</textarea></label>
+      <div class="m-actions"><span class="sub grow" id="rvTotal"></span><button class="btn" data-close>Cancel</button><button class="btn primary" id="rvSave">Save changes</button></div>`, (w, close) => {
+      const stBox = () => {
+        $('#rvStBox', w).innerHTML = isEst()
+          ? `Status<select id="rvSt">${Object.entries(EST_STATUS).map(([k, l]) => `<option value="${k}" ${work.est_status === k ? 'selected' : ''}>${l}</option>`).join('')}</select>`
+          : `Amount paid<input id="rvPaid" type="number" step="0.01" value="${Number(work.amount_paid) || 0}">`;
+        $('#rvDueLab', w).firstChild.textContent = isEst() ? 'Valid until' : 'Due';
+      };
+      const showTotal = () => {
+        work.tax_rate = parseFloat($('#rvTax', w).value) || 0;
+        $('#rvTotal', w).textContent = `Total in Folio ${money(impTotal(work))}, PDF ${money(d.total)}`;
+      };
+      const body = $('#rvLines', w);
+      body.addEventListener('input', (e) => {
+        const li = e.target.closest('[data-li]'); if (!li) return;
+        const it = work.items[+li.dataset.li], k = e.target.dataset.lk;
+        if (k === 'option') { if (e.target.value) { it.option = 'addon'; it.selected = e.target.value === 'addon-in'; if (!(it.qty > 0)) it.qty = 1; } else { delete it.option; delete it.selected; } body.innerHTML = lines(); }
+        else if (k === 'description' || k === 'kind') it[k] = e.target.value;
+        else it[k] = parseFloat(e.target.value) || 0;
+        showTotal();
+      });
+      body.addEventListener('click', (e) => { const b = e.target.closest('[data-ldel]'); if (!b) return; work.items.splice(+b.dataset.ldel, 1); body.innerHTML = lines(); showTotal(); });
+      w.addEventListener('change', (e) => {
+        if (e.target.id === 'rvSt') work.est_status = e.target.value;
+        if (e.target.id === 'rvPaid') work.amount_paid = parseFloat(e.target.value) || 0;
+      });
+      $('#rvTax', w).oninput = showTotal;
+      $('#rvType', w).onchange = () => { work.type = $('#rvType', w).value; stBox(); body.innerHTML = lines(); showTotal(); };
+      stBox(); showTotal();
+      $('#rvSave', w).onclick = () => {
+        Object.assign(d, {
+          type: work.type, number: $('#rvNum', w).value.trim(), issue_date: $('#rvDate', w).value, due_date: $('#rvDue', w).value,
+          tax_rate: parseFloat($('#rvTax', w).value) || 0, notes: $('#rvNotes', w).value, items: work.items,
+          est_status: work.est_status, amount_paid: work.amount_paid,
+          customer: { name: $('#rvName', w).value.trim(), email: $('#rvEmail', w).value.trim(), phone: $('#rvPhone', w).value.trim(), address: $('#rvAddr', w).value.trim() }
+        });
+        d.warnings = [];
+        const wasIncluded = r.include;
+        impCheck(r);
+        if (!r.dup) r.include = wasIncluded || true;
+        close(); drawImport();
+        toast('Changes saved for this import');
+      };
+    }, 'wide-form');
+  }
+
+  async function runImport(btn) {
+    const rows = IMP.rows.filter((r) => r.include && r.data);
+    if (!rows.length) return;
+    const co = company(($('#impCo') && $('#impCo').value) || ((S.filter !== 'all' && S.filter) || S.companies[0].id));
+    btn.disabled = true;
+    const st = $('#impStatus');
+    const custMap = new Map(S.customers.map((c) => [normName(c.name), c]));
+    // Estimates first, oldest first, so an invoice can join its estimate's job.
+    rows.sort((a, b) => (a.data.type === b.data.type ? 0 : a.data.type === 'estimate' ? -1 : 1) || String(a.data.issue_date).localeCompare(String(b.data.issue_date)));
+    const madeEst = [];
+    let done = 0, newCust = 0;
+    try {
+      for (const r of rows) {
+        const d = r.data;
+        if (st) st.textContent = `Importing ${done + 1} of ${rows.length}: ${typeName(d)} ${d.number}`;
+        const key = normName(d.customer.name) || 'unknown customer';
+        let c = custMap.get(key);
+        if (!c) {
+          c = await Store.upsert('customers', { name: d.customer.name || 'Unknown customer', email: d.customer.email || '', phone: d.customer.phone || '', address: d.customer.address || '', notes: '' });
+          upsertLocal(S.customers, c); custMap.set(key, c); newCust++;
+        } else {
+          const patch = {};
+          ['email', 'phone', 'address'].forEach((k) => { if (!c[k] && d.customer[k]) patch[k] = d.customer[k]; });
+          if (Object.keys(patch).length) { c = await Store.upsert('customers', { id: c.id, ...patch }); upsertLocal(S.customers, c); custMap.set(key, c); }
+        }
+        const items = impItems(d);
+        const docTotal = impTotal(d);
+        const est = d.type === 'invoice' ? madeEst.find((e) => e.customer_id === c.id && Math.abs(totals(e).total - docTotal) < 0.01 && !e.converted_id) : null;
+        let jobId = est ? est.job_id : null;
+        if (!jobId && !S.needsUpgrade2) {
+          const paidUp = d.type === 'invoice' && docTotal > 0 && d.amount_paid >= docTotal - 0.01;
+          const j = await Store.upsert('jobs', { company_id: co.id, customer_id: c.id, name: `${c.name}, ${d.number}`, address: d.customer.address || c.address || '',
+            status: d.type === 'invoice' ? (paidUp ? 'completed' : 'active') : d.est_status === 'accepted' ? 'active' : 'estimating', notes: '' });
+          upsertLocal(S.jobs, j); jobId = j.id;
+        }
+        const issued = d.issue_date || today();
+        const sentAt = d.type === 'estimate' && d.est_status === 'draft' ? null : new Date(issued + 'T12:00:00').toISOString();
+        const doc = {
+          company_id: co.id, job_id: jobId, customer_id: c.id, customer_name: c.name, customer_email: c.email || '', customer_phone: c.phone || '',
+          customer_address: d.customer.address || c.address || '', job_title: '', job_site: d.customer.address || c.address || '',
+          type: d.type, number: d.number || '', issue_date: issued, due_date: d.due_date || null,
+          status: d.type === 'estimate' ? d.est_status : 'sent', items, tax_rate: d.tax_rate || 0, discount_type: 'amount', discount_value: d.discount || 0,
+          notes: d.notes || '', terms: '', amount_paid: d.type === 'invoice' ? Math.min(Number(d.amount_paid) || 0, docTotal) : 0, total: docTotal,
+          sent_at: sentAt, show_photos: true, schedule: [], source_id: est ? est.id : null
+        };
+        if (d.type === 'estimate' && d.est_status === 'accepted') { doc.accepted_at = sentAt; doc.accepted_by = c.name; }
+        const saved = await Store.upsert('documents', doc);
+        upsertLocal(S.documents, saved);
+        if (saved.type === 'estimate') madeEst.push(saved);
+        if (est) { const u = await Store.upsert('documents', { id: est.id, status: 'converted', converted_id: saved.id }); upsertLocal(S.documents, u); Object.assign(est, u); }
+        if (saved.type === 'invoice' && saved.amount_paid > 0) {
+          const p = await Store.upsert('payments', { document_id: saved.id, amount: saved.amount_paid, paid_on: issued, method: 'Other', reference: '', note: 'Imported from Skynova' });
+          S.payments.push(p);
+        }
+        r.include = false; r.dup = true; done++;
+      }
+      if (st) st.textContent = '';
+      toast(`Imported ${plural(done, 'document')}${newCust ? `, ${plural(newCust, 'new customer')}` : ''}`, { ms: 7000 });
+    } catch (e) {
+      console.error(e);
+      if (st) st.textContent = '';
+      toast(`Stopped after ${plural(done, 'document')}: ${e.message}`, { type: 'error', ms: 10000 });
+    }
+    drawImport();
+    btn.disabled = false;
+  }
+
   // ---------------- Customers ----------------
   function vCustomers(v) {
     v.innerHTML = `
@@ -2346,6 +2601,11 @@ The database structure is in supabase/schema.sql and supabase/upgrade-1.sql from
         <h2>Notifications</h2>
         <p class="sub">Folio shows a notification when a customer opens or accepts an estimate or invoice, as long as Folio is open in a browser tab. Desktop notifications also appear when the tab is in the background.</p>
         ${notif}
+      </section>
+      <section class="set">
+        <h2>Import from Skynova</h2>
+        <p class="sub">Bring in your past estimates and invoices from Skynova PDFs. Customers, line items, notes and totals are filled in automatically, and you review everything before it's saved.</p>
+        <a class="btn" href="#/import">Import PDFs</a>
       </section>
       <section class="set">
         <h2>Folio app on your phone and tablet</h2>

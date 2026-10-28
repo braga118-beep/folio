@@ -1,8 +1,8 @@
 // Folio service worker: makes Folio installable and lets the app open even with a weak signal.
 // Your own files are always fetched fresh when online (so updates show right away);
 // the saved copy is only used when there's no connection.
-const CACHE = 'folio-v3';
-const SHELL = ['./', './index.html', './app.js', './render.js', './data.js', './styles.css', './config.js', './manifest.webmanifest', './icons/icon-192.png'];
+const CACHE = 'folio-v4';
+const SHELL = ['./', './index.html', './app.js', './render.js', './data.js', './importer.js', './styles.css', './config.js', './manifest.webmanifest', './icons/icon-192.png'];
 const LIBS = /(^|\.)(cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fonts\.googleapis\.com|fonts\.gstatic\.com)$/;
 
 self.addEventListener('install', (e) => {
