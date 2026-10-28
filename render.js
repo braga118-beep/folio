@@ -198,7 +198,7 @@
     };
     const rows = (doc.items || []).map((it) => `
       <tr class="${included(it) ? '' : 'p-off'}">
-        <td class="p-desc"><div class="p-kind">${it.kind ? esc(it.kind) : ''}${optTag(it)}</div>${nl(it.description)}</td>
+        <td class="p-desc"><div class="p-kind">${it.kind ? esc(it.kind) : ''}${optTag(it)}</div>${nl(it.description)}<div class="p-mob">${num(it.qty)} × ${money(it.price)}${it.unit ? ' ' + unitLabel(it.unit) : ''}</div></td>
         <td class="p-num">${money(it.price)}${it.unit ? `<div class="p-unit">${unitLabel(it.unit)}</div>` : ''}</td>
         <td class="p-num">${num(it.qty)}</td>
         <td class="p-num">${money((Number(it.qty) || 0) * (Number(it.price) || 0))}</td>
