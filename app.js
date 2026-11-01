@@ -2376,11 +2376,36 @@
       const img = new Image();
       const url = URL.createObjectURL(file);
       img.onload = () => {
-        const s = Math.min(1, 600 / Math.max(img.width, img.height));
-        const cv = document.createElement('canvas');
-        cv.width = Math.round(img.width * s); cv.height = Math.round(img.height * s);
-        cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
         URL.revokeObjectURL(url);
+        // 1. Draw at a workable size.
+        const s1 = Math.min(1, 1600 / Math.max(img.width, img.height));
+        const a = document.createElement('canvas');
+        a.width = Math.max(1, Math.round(img.width * s1)); a.height = Math.max(1, Math.round(img.height * s1));
+        const actx = a.getContext('2d');
+        actx.drawImage(img, 0, 0, a.width, a.height);
+        // 2. Trim empty borders (transparent or white) so the artwork fills the logo space.
+        let x0 = a.width, y0 = a.height, x1 = -1, y1 = -1;
+        try {
+          const px = actx.getImageData(0, 0, a.width, a.height).data;
+          for (let y = 0; y < a.height; y++) {
+            for (let x = 0; x < a.width; x++) {
+              const i = (y * a.width + x) * 4;
+              const empty = px[i + 3] < 16 || (px[i] > 242 && px[i + 1] > 242 && px[i + 2] > 242);
+              if (!empty) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+            }
+          }
+        } catch (e) { x0 = 0; y0 = 0; x1 = a.width - 1; y1 = a.height - 1; }
+        if (x1 < x0 || y1 < y0) { x0 = 0; y0 = 0; x1 = a.width - 1; y1 = a.height - 1; }
+        const pad = Math.round(Math.max(x1 - x0, y1 - y0) * 0.02);
+        x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(a.width - 1, x1 + pad); y1 = Math.min(a.height - 1, y1 + pad);
+        const w = x1 - x0 + 1, h = y1 - y0 + 1;
+        // 3. Save at up to 800 px on the long side: sharp on screen and in PDFs.
+        const s2 = Math.min(1, 800 / Math.max(w, h));
+        const cv = document.createElement('canvas');
+        cv.width = Math.max(1, Math.round(w * s2)); cv.height = Math.max(1, Math.round(h * s2));
+        const ctx = cv.getContext('2d');
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(a, x0, y0, w, h, 0, 0, cv.width, cv.height);
         res(cv.toDataURL('image/png'));
       };
       img.onerror = () => rej(new Error('That file could not be read as an image.'));
