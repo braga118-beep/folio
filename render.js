@@ -170,7 +170,7 @@
     const head = `
       <header class="p-head">
         <div class="p-from">
-          ${co.logo ? `<img class="p-logo" src="${co.logo}" alt="${esc(co.name)}">` : ''}
+          ${co.logo ? `<div class="p-logo" role="img" aria-label="${esc(co.name)}" style="background-image:url('${co.logo}')"></div>` : ''}
           <div class="p-co">${esc(co.name || '')}</div>
           <div class="p-lines">${companyLines(co)}</div>
         </div>

@@ -1046,7 +1046,7 @@
           <div class="p-band"></div>
           <header class="p-head">
             <div class="p-from">
-              ${co.logo ? `<img class="p-logo" src="${co.logo}" alt="">` : ''}
+              ${co.logo ? `<div class="p-logo" role="img" aria-label="" style="background-image:url('${co.logo}')"></div>` : ''}
               ${S.companies.length > 1
         ? `<select class="ghost p-co co-pick" data-f="company_id" aria-label="Company">${S.companies.map((c) => `<option value="${c.id}" ${c.id === d.company_id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>`
         : `<div class="p-co">${esc(co.name || '')}</div>`}
@@ -2399,8 +2399,8 @@
         const pad = Math.round(Math.max(x1 - x0, y1 - y0) * 0.02);
         x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(a.width - 1, x1 + pad); y1 = Math.min(a.height - 1, y1 + pad);
         const w = x1 - x0 + 1, h = y1 - y0 + 1;
-        // 3. Save at up to 800 px on the long side: sharp on screen and in PDFs.
-        const s2 = Math.min(1, 800 / Math.max(w, h));
+        // 3. Save at up to 1200 px on the long side: sharp on screen and in PDFs.
+        const s2 = Math.min(1, 1200 / Math.max(w, h));
         const cv = document.createElement('canvas');
         cv.width = Math.max(1, Math.round(w * s2)); cv.height = Math.max(1, Math.round(h * s2));
         const ctx = cv.getContext('2d');
@@ -2436,7 +2436,7 @@
           <div class="logo-field">
             <div class="logo-box" id="logoBox"></div>
             <div><div class="btn-row"><label class="btn">Upload logo<input type="file" id="logoIn" accept="image/png,image/jpeg,image/svg+xml,image/webp" class="vh"></label><button type="button" class="btn" id="logoRm">Remove</button></div>
-            <p class="sub">Your logo appears on estimates, change orders and invoices at <b>260 × 160</b>. For the sharpest result, upload a PNG about <b>1040 × 640 pixels</b> (at least 520 × 320), wider than it is tall, with a white or transparent background. Empty space around the logo is trimmed automatically.</p></div>
+            <p class="sub">Your logo appears on estimates, change orders and invoices in a <b>320 × 220</b> space. For the sharpest result, upload a PNG about <b>1280 × 880 pixels</b> (at least 640 × 440), with a white or transparent background. Empty space around the logo is trimmed automatically.</p></div>
           </div>
           <div class="grid2">
             ${f('name', 'Company name', 'text', 'required')}
