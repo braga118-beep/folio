@@ -2436,7 +2436,7 @@
           <div class="logo-field">
             <div class="logo-box" id="logoBox"></div>
             <div><div class="btn-row"><label class="btn">Upload logo<input type="file" id="logoIn" accept="image/png,image/jpeg,image/svg+xml,image/webp" class="vh"></label><button type="button" class="btn" id="logoRm">Remove</button></div>
-            <p class="sub">A PNG or SVG with a transparent background looks best.</p></div>
+            <p class="sub">Your logo appears on estimates, change orders and invoices at <b>260 × 160</b>. For the sharpest result, upload a PNG about <b>1040 × 640 pixels</b> (at least 520 × 320), wider than it is tall, with a white or transparent background. Empty space around the logo is trimmed automatically.</p></div>
           </div>
           <div class="grid2">
             ${f('name', 'Company name', 'text', 'required')}
