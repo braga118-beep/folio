@@ -748,3 +748,6 @@ body { overflow-x: clip; }
 .co-logo { width: 92px; height: 92px; border-radius: 14px; font-size: 32px; }
 .co-logo img { padding: 6px; }
 @media (max-width: 820px) { .logo-box { width: 100%; flex-basis: auto; height: 160px; } }
+/* Logo on estimates, change orders and invoices (web, PDF and JPEG): box 50% wider, 25% taller */
+.p-logo { max-width: 315px; max-height: 110px; width: auto; height: auto; object-fit: contain; }
+.p-from { max-width: 380px; }
